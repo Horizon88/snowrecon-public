@@ -1,0 +1,643 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Snowbunker Recon — Land Registry View</title>
+<script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+<link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet" />
+<script src="https://unpkg.com/pmtiles@3.2.0/dist/pmtiles.js"></script>
+<style>
+  :root { --bg:#0a0c10; --panel:#12151c; --border:#1e2330; --text:#c8cdd8; --dim:#6b7280; --accent:#3b82f6; --green:#10b981; --orange:#f59e0b; --red:#ef4444; --cyan:#06b6d4; --purple:#a855f7; }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { font-family:system-ui,-apple-system,sans-serif; background:var(--bg); color:var(--text); height:100vh; overflow:hidden; display:flex; }
+
+  .sidebar { width:360px; min-width:360px; background:var(--panel); border-right:1px solid var(--border); display:flex; flex-direction:column; z-index:1000; overflow-y:auto; }
+  .sidebar::-webkit-scrollbar { width:4px; }
+  .sidebar::-webkit-scrollbar-thumb { background:var(--border); }
+
+  .logo { padding:14px 16px; border-bottom:1px solid var(--border); }
+  .logo h1 { font-size:18px; font-weight:700; color:#fff; }
+  .logo .sub { font-size:10px; color:var(--dim); margin-top:2px; }
+
+  .section { padding:12px 16px; border-bottom:1px solid var(--border); }
+  .section-label { font-size:9px; text-transform:uppercase; letter-spacing:1.5px; color:var(--dim); margin-bottom:8px; font-weight:600; }
+
+  .btn { display:inline-flex; align-items:center; gap:4px; padding:5px 10px; border:1px solid var(--border); border-radius:3px; background:transparent; color:var(--dim); font-family:inherit; font-size:10px; cursor:pointer; transition:all 0.15s; margin:0 3px 3px 0; }
+  .btn:hover { border-color:var(--accent); color:var(--text); }
+  .btn.on { background:rgba(59,130,246,0.12); border-color:var(--accent); color:var(--accent); }
+  .btn.purple { background:rgba(168,85,247,0.12); border-color:var(--purple); color:var(--purple); }
+
+  .chip { display:inline-block; padding:3px 8px; border-radius:3px; font-size:10px; cursor:pointer; transition:all 0.15s; background:rgba(59,130,246,0.08); color:var(--accent); border:1px solid rgba(59,130,246,0.2); margin:0 3px 3px 0; }
+  .chip:hover { background:rgba(59,130,246,0.18); }
+
+  .info-box { background:rgba(0,0,0,0.25); border:1px solid var(--border); border-radius:4px; padding:10px 12px; }
+  .info-row { display:flex; justify-content:space-between; align-items:center; padding:3px 0; font-size:11px; }
+  .info-label { color:var(--dim); font-size:9px; }
+  .info-val { color:#fff; font-weight:500; }
+
+  .badge { display:inline-block; padding:2px 7px; border-radius:3px; font-size:10px; font-weight:600; }
+
+  .map-wrap { flex:1; position:relative; }
+  #map { width:100%; height:100%; }
+
+  .overlay { position:absolute; top:10px; right:10px; z-index:999; display:flex; flex-direction:column; gap:5px; }
+  .overlay-pill { background:rgba(10,12,16,0.9); border:1px solid var(--border); border-radius:4px; padding:5px 10px; font-size:10px; display:flex; align-items:center; gap:6px; }
+  .pulse { width:5px; height:5px; border-radius:50%; background:var(--green); animation:p 2s infinite; }
+  @keyframes p { 0%,100%{opacity:1} 50%{opacity:0.3} }
+
+  .parcel-info { background:rgba(0,0,0,0.25); border:1px solid var(--border); border-radius:4px; padding:8px 12px; margin-top:6px; }
+  .parcel-info .label { font-size:9px; color:var(--dim); }
+  .parcel-info .val { font-size:11px; color:#fff; font-weight:500; }
+
+  .maplibregl-popup-content { background:rgba(18,21,28,0.95)!important; border:1px solid var(--border)!important; border-radius:4px!important; color:var(--text)!important; font-family:system-ui!important; font-size:11px!important; padding:8px 12px!important; }
+  .maplibregl-popup-tip { border-top-color:rgba(18,21,28,0.95)!important; }
+  .maplibregl-popup-close-button { color:var(--dim)!important; font-size:16px!important; }
+
+  #parcelList { max-height:400px; overflow-y:auto; }
+  .parcel-card { padding:8px 10px; background:rgba(0,0,0,0.2); border:1px solid var(--border); border-radius:4px; margin-top:4px; cursor:pointer; transition:border-color 0.15s; }
+  .parcel-card:hover { border-color:var(--cyan); }
+  .parcel-card .name { font-size:11px; color:#fff; font-weight:500; }
+  .parcel-card .detail { font-size:9px; color:var(--dim); margin-top:2px; }
+
+  .legend { position:absolute; bottom:40px; left:10px; z-index:999; background:rgba(10,12,16,0.9); border:1px solid var(--border); border-radius:4px; padding:8px 10px; font-size:9px; }
+  .legend-row { display:flex; align-items:center; gap:6px; margin-top:3px; }
+  .legend-swatch { width:14px; height:10px; border-radius:1px; }
+</style>
+</head>
+<body>
+
+<div class="sidebar">
+  <div class="logo">
+    <h1>Snowbunker Recon <span style="font-size:11px;color:var(--cyan);font-weight:400">Land View</span></h1>
+    <div class="sub">Cadastral Parcels + Terrain — Hokkaido</div>
+  </div>
+
+  <!-- VIEW TOGGLE -->
+  <div class="section" style="padding:8px 16px">
+    <div style="display:flex;gap:3px;align-items:center;margin-bottom:6px">
+      <a href="index.html" class="btn" id="terrainViewLink" onclick="this.href=getTerrainViewUrl()" style="text-decoration:none;color:var(--purple);border-color:rgba(168,85,247,0.3)">← Terrain View</a>
+      <span class="btn on" style="cursor:default;color:var(--cyan);border-color:var(--cyan)">Land View</span>
+    </div>
+    <div style="display:flex;gap:3px;flex-wrap:wrap;margin-bottom:4px">
+      <button class="btn on" id="btn-topo" onclick="setBase('topo')">Topo</button>
+      <button class="btn" id="btn-sat" onclick="setBase('satellite')">Sat</button>
+      <button class="btn" id="btn-relief" onclick="setBase('relief')">Relief</button>
+      <span style="width:1px;background:var(--border);margin:0 2px"></span>
+      <button class="btn on" id="btn-parcels" onclick="toggleParcels(this)" style="color:var(--cyan);border-color:rgba(6,182,212,0.3)">Parcels</button>
+      <button class="btn" id="btn-slope-overlay" onclick="toggleSlopeOverlay(this)">Slope</button>
+      <button class="btn" id="btn-hillshade" onclick="toggleHillshade(this)">Shade</button>
+    </div>
+    <div style="display:flex;gap:3px;flex-wrap:wrap">
+      <span class="chip" onclick="flyTo(42.886,140.503,13)">Rankoshi</span>
+      <span class="chip" onclick="flyTo(43.055,140.686,13)">Akaigawa</span>
+      <span class="chip" onclick="flyTo(43.191,140.995,13)">Otaru</span>
+      <span class="chip" onclick="flyTo(42.975,140.985,14)">Kiroro</span>
+      <span class="chip" onclick="flyTo(43.08,140.45,13)">Raiden</span>
+    </div>
+  </div>
+
+  <!-- CLICK INFO -->
+  <div class="section" style="padding:8px 16px">
+    <div class="section-label" style="color:var(--cyan)">Parcel Info</div>
+    <div class="info-box" style="padding:6px 10px">
+      <div class="info-row"><span class="info-label">Location</span><span class="info-val" id="clickCoord" style="font-size:10px">Click map to inspect parcels</span></div>
+      <div class="info-row" id="parcelChiban" style="display:none"><span class="info-label">Chiban (地番)</span><span class="info-val" id="chibanVal" style="font-size:10px;color:var(--cyan)">—</span></div>
+      <div class="info-row" id="parcelArea" style="display:none"><span class="info-label">Area</span><span class="info-val" id="areaVal" style="font-size:10px">—</span></div>
+      <div id="parcelLinks" style="display:none;margin-top:6px;display:flex;gap:4px;flex-wrap:wrap"></div>
+    </div>
+    <div style="font-size:9px;color:var(--dim);margin-top:4px">
+      Click parcels to see boundaries and chiban numbers. Zoom to z15+ for best detail.
+    </div>
+  </div>
+
+  <!-- SAVED PARCELS -->
+  <div class="section" style="flex:1;display:flex;flex-direction:column;min-height:200px">
+    <div class="section-label" style="color:var(--cyan)">Saved Parcels</div>
+    <div style="display:flex;gap:4px;margin-bottom:6px">
+      <button class="btn" onclick="exportSavedParcels()" style="font-size:9px">Export CSV</button>
+      <button class="btn" onclick="clearSavedParcels()" style="font-size:9px;color:var(--red);border-color:rgba(239,68,68,0.3)">Clear All</button>
+      <span style="flex:1"></span>
+      <span id="savedCount" style="font-size:9px;color:var(--dim);align-self:center">0 parcels</span>
+    </div>
+    <div id="parcelList" style="overflow-y:auto;flex:1"></div>
+  </div>
+
+  <!-- INSTRUCTIONS -->
+  <div class="section" style="padding:8px 16px">
+    <div class="section-label">How To Use</div>
+    <div style="font-size:9px;color:var(--dim);line-height:1.6">
+      1. Zoom to z15+ on your target area<br>
+      2. Parcel boundaries appear as cyan lines<br>
+      3. Click a parcel to see its chiban number<br>
+      4. Use "Save Parcel" to add to your list<br>
+      5. Export CSV for registry lookup at 法務局<br>
+      <br>
+      <b style="color:var(--orange)">Chiban → Owner lookup:</b><br>
+      Take chiban numbers to Otaru Legal Affairs Bureau<br>
+      (小樽地方法務局) or use 登記情報提供サービス online.
+    </div>
+  </div>
+</div>
+
+<div class="map-wrap">
+  <div id="map"></div>
+  <div class="overlay">
+    <div class="overlay-pill"><span class="pulse"></span> Cadastral PMTiles</div>
+  </div>
+  <div class="legend" id="parcelLegend">
+    <div style="font-weight:600;color:var(--cyan);margin-bottom:3px">Parcel Boundaries</div>
+    <div class="legend-row"><span class="legend-swatch" style="background:rgba(6,182,212,0.4);border:1px solid #06b6d4"></span> Cadastral parcel</div>
+    <div class="legend-row"><span class="legend-swatch" style="background:rgba(168,85,247,0.4);border:1px solid #a855f7"></span> Selected parcel</div>
+    <div class="legend-row"><span class="legend-swatch" style="background:rgba(245,158,11,0.4);border:1px solid #f59e0b"></span> Saved parcel</div>
+    <div style="margin-top:4px;color:var(--dim);font-size:8px">Data: MOJ 法務省登記所備付地図 (2024)</div>
+  </div>
+</div>
+
+<script>
+// ===== PMTILES SETUP =====
+const pmtilesProtocol = new pmtiles.Protocol();
+maplibregl.addProtocol('pmtiles', pmtilesProtocol.tile);
+
+const CADASTRAL_PMTILES_URL = 'https://data.source.coop/smartmaps/amx-2024-04/MojMap_amx_2024.pmtiles';
+
+// ===== MAP =====
+const map = new maplibregl.Map({
+  container: 'map',
+  style: {
+    version: 8,
+    glyphs: 'https://demotiles.maplibre.org/font/{fontstack}/{range}.pbf',
+    sources: {
+      'gsi-topo': {
+        type: 'raster',
+        tiles: ['https://cyberjapandata.gsi.go.jp/xyz/std/{z}/{x}/{y}.png'],
+        tileSize: 256,
+        maxzoom: 18,
+        attribution: '© GSI'
+      },
+      'gsi-satellite': {
+        type: 'raster',
+        tiles: ['https://cyberjapandata.gsi.go.jp/xyz/seamlessphoto/{z}/{x}/{y}.jpg'],
+        tileSize: 256,
+        maxzoom: 18,
+        attribution: '© GSI'
+      },
+      'gsi-relief': {
+        type: 'raster',
+        tiles: ['https://cyberjapandata.gsi.go.jp/xyz/relief/{z}/{x}/{y}.png'],
+        tileSize: 256,
+        maxzoom: 15,
+        attribution: '© GSI'
+      },
+      'gsi-slope': {
+        type: 'raster',
+        tiles: ['https://cyberjapandata.gsi.go.jp/xyz/slopemap/{z}/{x}/{y}.png'],
+        tileSize: 256,
+        maxzoom: 15,
+        attribution: '© GSI'
+      },
+      'gsi-hillshade': {
+        type: 'raster',
+        tiles: ['https://cyberjapandata.gsi.go.jp/xyz/hillshademap/{z}/{x}/{y}.png'],
+        tileSize: 256,
+        maxzoom: 16,
+        attribution: '© GSI'
+      },
+      'cadastral': {
+        type: 'vector',
+        url: `pmtiles://${CADASTRAL_PMTILES_URL}`,
+        attribution: '© MOJ 法務省'
+      }
+    },
+    layers: [
+      // Base layers (only topo visible by default)
+      {
+        id: 'base-topo',
+        type: 'raster',
+        source: 'gsi-topo',
+        layout: { visibility: 'visible' }
+      },
+      {
+        id: 'base-satellite',
+        type: 'raster',
+        source: 'gsi-satellite',
+        layout: { visibility: 'none' }
+      },
+      {
+        id: 'base-relief',
+        type: 'raster',
+        source: 'gsi-relief',
+        layout: { visibility: 'none' }
+      },
+      // Overlays
+      {
+        id: 'overlay-slope',
+        type: 'raster',
+        source: 'gsi-slope',
+        layout: { visibility: 'none' },
+        paint: { 'raster-opacity': 0.6 }
+      },
+      {
+        id: 'overlay-hillshade',
+        type: 'raster',
+        source: 'gsi-hillshade',
+        layout: { visibility: 'none' },
+        paint: { 'raster-opacity': 0.5 }
+      },
+      // Cadastral parcel fills (subtle)
+      {
+        id: 'cadastral-fill',
+        type: 'fill',
+        source: 'cadastral',
+        'source-layer': 'fude',
+        layout: { visibility: 'visible' },
+        paint: {
+          'fill-color': '#06b6d4',
+          'fill-opacity': [
+            'interpolate', ['linear'], ['zoom'],
+            14, 0,
+            15, 0.03,
+            16, 0.06
+          ]
+        }
+      },
+      // Cadastral parcel outlines
+      {
+        id: 'cadastral-outline',
+        type: 'line',
+        source: 'cadastral',
+        'source-layer': 'fude',
+        layout: { visibility: 'visible' },
+        paint: {
+          'line-color': '#06b6d4',
+          'line-width': [
+            'interpolate', ['linear'], ['zoom'],
+            14, 0.3,
+            16, 1,
+            18, 1.5
+          ],
+          'line-opacity': [
+            'interpolate', ['linear'], ['zoom'],
+            13, 0,
+            14, 0.3,
+            15, 0.5,
+            16, 0.7
+          ]
+        }
+      },
+      // Cadastral labels (chiban)
+      {
+        id: 'cadastral-labels',
+        type: 'symbol',
+        source: 'cadastral',
+        'source-layer': 'daihyo',
+        layout: {
+          visibility: 'visible',
+          'text-field': ['get', '地番'],
+          'text-size': [
+            'interpolate', ['linear'], ['zoom'],
+            15, 8,
+            17, 11,
+            18, 13
+          ],
+          'text-allow-overlap': false,
+          'text-ignore-placement': false,
+          'text-padding': 4
+        },
+        paint: {
+          'text-color': '#06b6d4',
+          'text-halo-color': 'rgba(10,12,16,0.9)',
+          'text-halo-width': 1.5,
+          'text-opacity': [
+            'interpolate', ['linear'], ['zoom'],
+            15, 0,
+            16, 0.7,
+            17, 1
+          ]
+        }
+      }
+    ]
+  },
+  center: [140.55, 42.95],
+  zoom: 11,
+  maxZoom: 18
+});
+
+map.addControl(new maplibregl.NavigationControl(), 'bottom-right');
+map.addControl(new maplibregl.ScaleControl({ unit: 'metric' }), 'bottom-left');
+
+// ===== STATE =====
+let savedParcels = JSON.parse(localStorage.getItem('snowbunker-parcels') || '[]');
+let selectedParcelFeature = null;
+let popup = null;
+
+// ===== BASE LAYER SWITCHING =====
+const baseLayerIds = ['base-topo', 'base-satellite', 'base-relief'];
+const baseButtons = { topo: 'btn-topo', satellite: 'btn-sat', relief: 'btn-relief' };
+
+function setBase(name) {
+  const layerMap = { topo: 'base-topo', satellite: 'base-satellite', relief: 'base-relief' };
+  for (const [key, layerId] of Object.entries(layerMap)) {
+    map.setLayoutProperty(layerId, 'visibility', key === name ? 'visible' : 'none');
+  }
+  Object.entries(baseButtons).forEach(([key, btnId]) => {
+    document.getElementById(btnId).classList.toggle('on', key === name);
+  });
+}
+
+function toggleParcels(btn) {
+  const vis = map.getLayoutProperty('cadastral-outline', 'visibility');
+  const newVis = vis === 'visible' ? 'none' : 'visible';
+  map.setLayoutProperty('cadastral-fill', 'visibility', newVis);
+  map.setLayoutProperty('cadastral-outline', 'visibility', newVis);
+  map.setLayoutProperty('cadastral-labels', 'visibility', newVis);
+  btn.classList.toggle('on', newVis === 'visible');
+}
+
+function toggleSlopeOverlay(btn) {
+  const vis = map.getLayoutProperty('overlay-slope', 'visibility');
+  const newVis = vis === 'visible' ? 'none' : 'visible';
+  map.setLayoutProperty('overlay-slope', 'visibility', newVis);
+  btn.classList.toggle('on', newVis === 'visible');
+}
+
+function toggleHillshade(btn) {
+  const vis = map.getLayoutProperty('overlay-hillshade', 'visibility');
+  const newVis = vis === 'visible' ? 'none' : 'visible';
+  map.setLayoutProperty('overlay-hillshade', 'visibility', newVis);
+  btn.classList.toggle('on', newVis === 'visible');
+}
+
+function flyTo(lat, lng, z) {
+  map.flyTo({ center: [lng, lat], zoom: z, duration: 1200 });
+}
+
+// ===== CLICK HANDLER =====
+map.on('click', (e) => {
+  const lng = e.lngLat.lng;
+  const lat = e.lngLat.lat;
+
+  document.getElementById('clickCoord').textContent = `${lat.toFixed(5)}, ${lng.toFixed(5)}`;
+
+  // Query cadastral features under click
+  const features = map.queryRenderedFeatures(e.point, { layers: ['cadastral-fill'] });
+
+  if (features.length > 0) {
+    const feature = features[0];
+    selectedParcelFeature = feature;
+
+    // Extract properties
+    const props = feature.properties;
+    const chiban = props['地番'] || props['chiban'] || '—';
+    const area = props['面積'] || props['area'] || null;
+
+    // Show info
+    document.getElementById('parcelChiban').style.display = 'flex';
+    document.getElementById('chibanVal').textContent = chiban;
+
+    if (area) {
+      document.getElementById('parcelArea').style.display = 'flex';
+      document.getElementById('areaVal').textContent = `${parseFloat(area).toFixed(1)} m²`;
+    } else {
+      document.getElementById('parcelArea').style.display = 'none';
+    }
+
+    // Show links
+    const linksEl = document.getElementById('parcelLinks');
+    linksEl.style.display = 'flex';
+    linksEl.innerHTML = `
+      <a href="https://maps.gsi.go.jp/#17/${lat.toFixed(6)}/${lng.toFixed(6)}/" target="_blank"
+        style="font-size:8px;color:var(--accent);text-decoration:none;padding:2px 6px;border:1px solid rgba(59,130,246,0.3);border-radius:2px">GSI Map</a>
+      <a href="https://www.google.com/maps/@${lat.toFixed(6)},${lng.toFixed(6)},17z/data=!3m1!1e3" target="_blank"
+        style="font-size:8px;color:var(--green);text-decoration:none;padding:2px 6px;border:1px solid rgba(16,185,129,0.3);border-radius:2px">Google Sat</a>
+      <a href="https://www1.touki.or.jp/" target="_blank"
+        style="font-size:8px;color:var(--orange);text-decoration:none;padding:2px 6px;border:1px solid rgba(245,158,11,0.3);border-radius:2px">登記情報</a>
+      <button onclick="saveCurrentParcel()" class="btn" style="font-size:8px;color:var(--cyan);border-color:var(--cyan);padding:2px 6px">Save Parcel</button>
+    `;
+
+    // Show popup on map
+    if (popup) popup.remove();
+    popup = new maplibregl.Popup({ closeButton: true, maxWidth: '200px' })
+      .setLngLat(e.lngLat)
+      .setHTML(`<div style="line-height:1.5"><b style="color:#06b6d4">地番: ${chiban}</b><br><span style="font-size:10px;color:#6b7280">${lat.toFixed(5)}, ${lng.toFixed(5)}</span>${area ? `<br><span style="font-size:10px">${parseFloat(area).toFixed(1)} m²</span>` : ''}</div>`)
+      .addTo(map);
+
+    // Highlight the parcel
+    if (map.getSource('selected-parcel')) {
+      map.getSource('selected-parcel').setData(feature);
+    }
+  } else {
+    document.getElementById('parcelChiban').style.display = 'none';
+    document.getElementById('parcelArea').style.display = 'none';
+    document.getElementById('parcelLinks').style.display = 'none';
+    selectedParcelFeature = null;
+  }
+});
+
+// Add a selected parcel highlight layer
+map.on('load', () => {
+  map.addSource('selected-parcel', {
+    type: 'geojson',
+    data: { type: 'FeatureCollection', features: [] }
+  });
+
+  map.addLayer({
+    id: 'selected-parcel-fill',
+    type: 'fill',
+    source: 'selected-parcel',
+    paint: {
+      'fill-color': '#a855f7',
+      'fill-opacity': 0.2
+    }
+  });
+
+  map.addLayer({
+    id: 'selected-parcel-outline',
+    type: 'line',
+    source: 'selected-parcel',
+    paint: {
+      'line-color': '#a855f7',
+      'line-width': 2.5
+    }
+  });
+
+  // Add saved parcels layer
+  map.addSource('saved-parcels', {
+    type: 'geojson',
+    data: { type: 'FeatureCollection', features: [] }
+  });
+
+  map.addLayer({
+    id: 'saved-parcels-fill',
+    type: 'fill',
+    source: 'saved-parcels',
+    paint: {
+      'fill-color': '#f59e0b',
+      'fill-opacity': 0.15
+    }
+  });
+
+  map.addLayer({
+    id: 'saved-parcels-outline',
+    type: 'line',
+    source: 'saved-parcels',
+    paint: {
+      'line-color': '#f59e0b',
+      'line-width': 2
+    }
+  });
+
+  renderSavedParcelsOnMap();
+  renderParcelList();
+});
+
+// Change cursor on parcel hover
+map.on('mouseenter', 'cadastral-fill', () => {
+  map.getCanvas().style.cursor = 'pointer';
+});
+map.on('mouseleave', 'cadastral-fill', () => {
+  map.getCanvas().style.cursor = '';
+});
+
+// ===== SAVE PARCELS =====
+function saveCurrentParcel() {
+  if (!selectedParcelFeature) return;
+
+  const props = selectedParcelFeature.properties;
+  const coords = popup ? popup.getLngLat() : null;
+
+  const parcel = {
+    id: Date.now().toString(36) + Math.random().toString(36).substr(2, 4),
+    chiban: props['地番'] || props['chiban'] || '—',
+    area: props['面積'] || props['area'] || null,
+    lat: coords ? coords.lat : null,
+    lng: coords ? coords.lng : null,
+    geometry: selectedParcelFeature.geometry,
+    savedAt: new Date().toISOString(),
+    notes: ''
+  };
+
+  // Avoid duplicates by chiban + rough location
+  const isDupe = savedParcels.some(p =>
+    p.chiban === parcel.chiban &&
+    p.lat && parcel.lat &&
+    Math.abs(p.lat - parcel.lat) < 0.001
+  );
+
+  if (isDupe) {
+    alert('This parcel is already saved.');
+    return;
+  }
+
+  savedParcels.push(parcel);
+  localStorage.setItem('snowbunker-parcels', JSON.stringify(savedParcels));
+  renderParcelList();
+  renderSavedParcelsOnMap();
+}
+
+function removeSavedParcel(id) {
+  savedParcels = savedParcels.filter(p => p.id !== id);
+  localStorage.setItem('snowbunker-parcels', JSON.stringify(savedParcels));
+  renderParcelList();
+  renderSavedParcelsOnMap();
+}
+
+function clearSavedParcels() {
+  if (!confirm('Clear all saved parcels?')) return;
+  savedParcels = [];
+  localStorage.setItem('snowbunker-parcels', JSON.stringify(savedParcels));
+  renderParcelList();
+  renderSavedParcelsOnMap();
+}
+
+function renderSavedParcelsOnMap() {
+  if (!map.getSource('saved-parcels')) return;
+
+  const features = savedParcels
+    .filter(p => p.geometry)
+    .map(p => ({
+      type: 'Feature',
+      geometry: p.geometry,
+      properties: { chiban: p.chiban, id: p.id }
+    }));
+
+  map.getSource('saved-parcels').setData({
+    type: 'FeatureCollection',
+    features
+  });
+}
+
+function renderParcelList() {
+  const container = document.getElementById('parcelList');
+  const countEl = document.getElementById('savedCount');
+  countEl.textContent = `${savedParcels.length} parcels`;
+
+  if (savedParcels.length === 0) {
+    container.innerHTML = '<div style="font-size:10px;color:var(--dim);padding:8px;text-align:center">No parcels saved. Click a parcel on the map and hit "Save Parcel".</div>';
+    return;
+  }
+
+  container.innerHTML = '';
+  for (const p of savedParcels) {
+    const card = document.createElement('div');
+    card.className = 'parcel-card';
+    card.innerHTML = `
+      <div style="display:flex;align-items:center;gap:6px">
+        <span class="name">地番: ${p.chiban}</span>
+        <span style="flex:1"></span>
+        <button onclick="event.stopPropagation();removeSavedParcel('${p.id}')" style="background:none;border:none;color:var(--red);cursor:pointer;font-size:10px;padding:2px 4px">×</button>
+      </div>
+      <div class="detail">
+        ${p.lat ? `${p.lat.toFixed(5)}, ${p.lng.toFixed(5)}` : ''}
+        ${p.area ? ` · ${parseFloat(p.area).toFixed(1)} m²` : ''}
+      </div>
+    `;
+
+    card.addEventListener('click', () => {
+      if (p.lat && p.lng) {
+        map.flyTo({ center: [p.lng, p.lat], zoom: 17, duration: 1000 });
+      }
+    });
+
+    container.appendChild(card);
+  }
+}
+
+function exportSavedParcels() {
+  if (savedParcels.length === 0) return;
+
+  let csv = 'Chiban,Latitude,Longitude,Area_m2,Notes,Saved_At\n';
+  for (const p of savedParcels) {
+    csv += `"${p.chiban}",${p.lat || ''},${p.lng || ''},${p.area || ''},"${p.notes || ''}","${p.savedAt}"\n`;
+  }
+
+  const blob = new Blob([csv], { type: 'text/csv; charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'snowbunker-parcels.csv';
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+// ===== SHARE STATE WITH TERRAIN VIEW =====
+function getTerrainViewUrl() {
+  const c = map.getCenter();
+  const z = map.getZoom();
+  return `index.html?lat=${c.lat.toFixed(5)}&lng=${c.lng.toFixed(5)}&z=${z.toFixed(1)}`;
+}
+
+// Read zoom/center from URL params if coming from terrain view
+const urlParams = new URLSearchParams(window.location.search);
+if (urlParams.has('lat') && urlParams.has('lng') && urlParams.has('z')) {
+  const lat = parseFloat(urlParams.get('lat'));
+  const lng = parseFloat(urlParams.get('lng'));
+  const z = parseFloat(urlParams.get('z'));
+  if (!isNaN(lat) && !isNaN(lng) && !isNaN(z)) {
+    map.setCenter([lng, lat]);
+    map.setZoom(z);
+  }
+}
+</script>
+</body>
+</html>

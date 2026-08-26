@@ -33,22 +33,6 @@ const RunEngine = (() => {
     return arr;
   }
 
-  async function parseTerrariumImage(blob) {
-    const bitmap = await createImageBitmap(blob);
-    const canvas = document.createElement('canvas');
-    canvas.width = 256; canvas.height = 256;
-    const ctx = canvas.getContext('2d', { willReadFrequently: true });
-    ctx.drawImage(bitmap, 0, 0, 256, 256);
-    bitmap.close();
-    const rgba = ctx.getImageData(0, 0, 256, 256).data;
-    const arr = new Float32Array(256 * 256);
-    for (let i = 0, p = 0; i < arr.length; i++, p += 4) {
-      const elevation = rgba[p] * 256 + rgba[p + 1] + rgba[p + 2] / 256 - 32768;
-      arr[i] = elevation < -500 ? NaN : elevation;
-    }
-    return arr;
-  }
-
   function latLngToTile(lat, lng, zoom) {
     const n = Math.pow(2, zoom);
     const tileX = Math.floor((lng + 180) / 360 * n);
@@ -66,16 +50,8 @@ const RunEngine = (() => {
 
     const promise = (async () => {
       try {
-        const demUrl = region === 'usa'
-          ? `https://s3.amazonaws.com/elevation-tiles-prod/terrarium/${key}.png`
-          : `https://cyberjapandata.gsi.go.jp/xyz/dem/${key}.txt`;
-        const resp = await fetch(demUrl);
+        const resp = await fetch(`/api/dem/${key}${region === 'usa' ? '?region=usa' : ''}`);
         if (resp.ok) {
-          if (region === 'usa') {
-            const arr = await parseTerrariumImage(await resp.blob());
-            parsedCache[key] = arr;
-            return arr;
-          }
           const text = await resp.text();
           if (text.trim().length > 0 && !text.includes('No elevation')) {
             const arr = parseDEMText(text);
@@ -586,11 +562,19 @@ const RunEngine = (() => {
 out geom;`;
 
     try {
-      const resp = await fetch('https://overpass-api.de/api/interpreter', {
+      let resp = await fetch('/api/overpass', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: 'data=' + encodeURIComponent(query),
+        headers: { 'Content-Type': 'text/plain' },
+        body: query,
       });
+      // Static/public builds do not have the SnowRecon proxy. Overpass supports
+      // browser CORS, so fall back to its public interpreter for road-only lookup.
+      if (!resp.ok) {
+        resp = await fetch('https://overpass-api.de/api/interpreter', {
+          method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: `data=${encodeURIComponent(query)}`,
+        });
+      }
       if (!resp.ok) throw new Error(`Overpass: ${resp.status}`);
       const data = await resp.json();
 
@@ -817,10 +801,10 @@ out geom;`;
 out body geom;`;
 
     try {
-      const resp = await fetch('https://overpass-api.de/api/interpreter', {
+      const resp = await fetch('/api/overpass', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: 'data=' + encodeURIComponent(query),
+        headers: { 'Content-Type': 'text/plain' },
+        body: query,
       });
       if (!resp.ok) throw new Error(`Overpass: ${resp.status}`);
       const data = await resp.json();
@@ -1396,3 +1380,4 @@ out body geom;`;
   };
 
 })();
+

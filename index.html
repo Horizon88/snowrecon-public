@@ -146,6 +146,7 @@
     </div>
     <div style="display:flex;gap:3px;flex-wrap:wrap;margin-bottom:4px">
       <button class="btn" id="btn-forest" onclick="toggleForestAnalysis(this)" style="color:var(--green);border-color:rgba(16,185,129,0.3)">Trees</button>
+      <button class="btn" id="btn-forestryphoto" onclick="toggleOverlay('forestryphoto',this)" style="color:#facc15;border-color:rgba(250,204,21,.35)" title="GSI aerial imagery collected for privately owned forests">Forestry Photo</button>
       <button class="btn" id="btn-changes" onclick="toggleChangeDetection(this)" style="color:var(--red);border-color:rgba(239,68,68,0.3)">Changes</button>
       <button class="btn" id="btn-gazo1" onclick="toggleOverlay('gazo1',this)">1961</button>
       <button class="btn" id="btn-ort_old10" onclick="toggleOverlay('ort_old10',this)">~2007</button>
@@ -407,6 +408,7 @@ const overlayLayers = {
   gazo2: L.tileLayer('https://cyberjapandata.gsi.go.jp/xyz/gazo2/{z}/{x}/{y}.jpg', { maxNativeZoom: 17, maxZoom: 18, opacity: 0.8, attribution: '© GSI 1974-78', errorTileUrl: '' }),
   gazo4: L.tileLayer('https://cyberjapandata.gsi.go.jp/xyz/gazo4/{z}/{x}/{y}.jpg', { maxNativeZoom: 17, maxZoom: 18, opacity: 0.8, attribution: '© GSI 1988-90', errorTileUrl: '' }),
   ort_old10: L.tileLayer('https://cyberjapandata.gsi.go.jp/xyz/ort_old10/{z}/{x}/{y}.png', { maxNativeZoom: 12, maxZoom: 18, opacity: 0.8, attribution: '© GSI ~2007', errorTileUrl: '' }),
+  forestryphoto: L.tileLayer('https://cyberjapandata.gsi.go.jp/xyz/rinya_m/{z}/{x}/{y}.png', { minZoom: 14, maxNativeZoom: 18, maxZoom: 19, opacity: 0.82, attribution: '© GSI / prefectural private-forest aerial imagery', errorTileUrl: '' }),
 };
 
 baseLayers.topo.addTo(map);
@@ -1848,9 +1850,23 @@ async function findCatAccess(run) {
 // ===== ROADS OVERLAY =====
 function drawRoadsOnMap(roads) {
   if (roadsLayer) map.removeLayer(roadsLayer);
-  const lines = roads.map(r => L.polyline(r.coords, {
-    color: '#f59e0b', weight: 1.5, opacity: 0.6
-  }));
+  const roadStyle = r => {
+    if (r.type === 'track') return { color:'#ff2da4', weight:4.5, opacity:.95, dashArray:null, label:'Forestry / vehicle track', priority:'HIGH' };
+    if (r.type === 'service') return { color:'#f59e0b', weight:3.5, opacity:.9, dashArray:null, label:'Service road', priority:'HIGH' };
+    if (r.type === 'unclassified') return { color:'#22d3ee', weight:3, opacity:.82, dashArray:null, label:'Unclassified road', priority:'MEDIUM' };
+    if (r.type === 'path') return { color:'#c084fc', weight:2.2, opacity:.8, dashArray:'6 5', label:'Path / possible skid trail', priority:'VERIFY' };
+    return { color:'#94a3b8', weight:2, opacity:.62, dashArray:null, label:`${r.type || 'Road'}`, priority:'LOW' };
+  };
+  const lines = [];
+  roads.forEach(r => {
+    const s = roadStyle(r);
+    lines.push(L.polyline(r.coords, { color:'#090b10', weight:s.weight + 3, opacity:.7, interactive:false }));
+    const line = L.polyline(r.coords, { color:s.color, weight:s.weight, opacity:s.opacity, dashArray:s.dashArray });
+    line.bindPopup(`<b>${s.label}</b><br>Access priority: ${s.priority}<br>` +
+      `Name: ${escapeHtml(r.name || 'unnamed')}<br>Surface: ${escapeHtml(r.surface || 'unknown')}<br>` +
+      `Access tag: ${escapeHtml(r.access || 'unknown')}<br><small>Mapped road presence does not prove legal access or winter passability.</small>`);
+    lines.push(line);
+  });
   roadsLayer = L.layerGroup(lines).addTo(map);
   roadsVisible = true;
   document.getElementById('btn-roads').classList.add('on');
@@ -1874,7 +1890,8 @@ function toggleRoads(btn) {
     RunEngine.fetchRoads(getCorridorBounds()).then(roads => {
       if (roads.length > 0) {
         drawRoadsOnMap(roads);
-        log(`Loaded ${roads.length} road segments`, 'ok');
+        const forestry = roads.filter(r => r.type === 'track' || r.type === 'service').length;
+        log(`Loaded ${roads.length} road segments · ${forestry} forestry/service candidates highlighted`, 'ok');
       } else {
         log('No roads found in corridor', 'warn');
         btn.classList.remove('on');
@@ -5648,4 +5665,3 @@ drawMissionCandidates();
 </script>
 </body>
 </html>
-

@@ -236,6 +236,7 @@
     </div>
     <div style="display:flex;gap:5px;margin-bottom:6px">
       <button class="scan-btn purple" id="missionLaunchBtn" onclick="launchReconMission()" style="flex:1">Launch Recon Mission</button>
+      <button class="btn" id="missionLandBtn" onclick="checkMissionLand()" style="color:var(--cyan);border-color:rgba(6,182,212,.4)" title="Match ranked terrain leads to official parcel records">Check Land</button>
       <button class="btn" id="missionPauseBtn" onclick="toggleMissionPause()" disabled>Pause</button>
       <button class="btn" onclick="rejectCurrentMapArea()" style="color:var(--red);border-color:rgba(239,68,68,.45)" title="Reject everything inside the current map view and remember why">Reject View</button>
       <button class="btn" onclick="clearReconMission()">Clear</button>
@@ -247,6 +248,7 @@
       <div style="display:flex;gap:4px;flex-wrap:wrap">
         <div class="mission-stat"><b id="missionCells">0/0</b><span>cells</span></div>
         <div class="mission-stat"><b id="missionLeads">0</b><span>leads</span></div>
+        <div class="mission-stat"><b id="missionLand">0</b><span>parcel matches</span></div>
         <div class="mission-stat"><b id="missionRejected">0</b><span>rejected</span></div>
         <div class="mission-stat"><b id="missionErrors">0</b><span>errors</span></div>
       </div>
@@ -339,6 +341,7 @@
     <div><span style="display:inline-block;width:15px;border-top:3px solid #10b981;margin-right:5px"></span>Green solid line = scored ski run</div>
     <div><span style="display:inline-block;width:15px;border-top:2px dashed #16a34a;margin-right:5px"></span>Green dashed boundary = government forest</div>
     <div><span style="display:inline-block;width:15px;border-top:3px dashed #22d3ee;margin-right:5px"></span>Cyan dashed line = tested cat route</div>
+    <div><span style="display:inline-block;width:15px;border-top:2px solid #67e8f9;margin-right:5px"></span>Cyan parcel = official mapped land plot</div>
     <div><span style="display:inline-block;width:10px;height:7px;background:rgba(168,85,247,.32);border:1px solid #a855f7;margin-right:5px"></span>Purple area = advance lead</div>
     <div><span style="display:inline-block;width:10px;height:7px;background:rgba(245,158,11,.28);border:1px solid #f59e0b;margin-right:5px"></span>Orange area = watch lead</div>
   </div>
@@ -2144,6 +2147,160 @@ let missionRunning = false;
 let missionPaused = false;
 let missionStopRequested = false;
 let missionLayer = L.layerGroup().addTo(map);
+let missionParcelLayer = L.layerGroup().addTo(map);
+const missionParcelGeometry = new Map();
+
+function escapeLandText(value) {
+  return String(value == null ? '' : value).replace(/[&<>'"]/g, ch => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;'
+  })[ch]);
+}
+
+function landCheckLabel(candidate) {
+  const land = candidate.landCheck;
+  if (!land) return 'Land unchecked';
+  if (land.status === 'checking') return 'Checking official parcels…';
+  if (land.status === 'unsupported_jurisdiction') return 'Parcel adapter not connected here';
+  if (land.status === 'no_parcel_at_point') return 'No mapped parcel at candidate center';
+  if (land.status === 'error') return `Land check error: ${land.error || 'retry'}`;
+  if (land.status !== 'matched') return 'Land status unknown';
+  const p = land.parcels[0] || {};
+  const acres = p.acres == null ? 'acreage unknown' : `${p.acres.toFixed(0)} ac`;
+  return `${land.landPathLabel} · ${acres}`;
+}
+
+function scoreLandFit(candidate, payload) {
+  const parcel = payload.parcels[0];
+  if (!parcel) return { score25: 0, combinedScore: Math.round(candidate.score * .75), landPath: 'no_match', landPathLabel: 'No parcel match' };
+  const acres = Math.max(0, parcel.acres || 0);
+  const ownershipPts = parcel.ownershipClass === 'private' ? 15 : parcel.ownershipClass === 'public' ? 4 : 2;
+  const acreagePts = Math.min(10, acres / 16);
+  const score25 = Math.round(Math.min(25, ownershipPts + acreagePts));
+  const accessGood = candidate.catAccess && ['A', 'B'].includes(candidate.catAccess.grade);
+  let landPath = 'diligence';
+  let landPathLabel = 'Ownership diligence';
+  if (parcel.ownershipClass === 'public') {
+    landPath = 'permit_path'; landPathLabel = 'Public land / permit path';
+  } else if (parcel.ownershipClass === 'private' && acres >= 80 && accessGood && candidate.verticalM >= 350) {
+    landPath = 'purchase_lead'; landPathLabel = 'Private purchase lead';
+  } else if (parcel.ownershipClass === 'private') {
+    landPath = 'private_followup'; landPathLabel = 'Private parcel follow-up';
+  }
+  return { score25, combinedScore: Math.round(candidate.score * .75 + score25), landPath, landPathLabel };
+}
+
+function missionCandidateSort(a, b) {
+  if (a.verdict === 'reject' && b.verdict !== 'reject') return 1;
+  if (b.verdict === 'reject' && a.verdict !== 'reject') return -1;
+  const landRank = { purchase_lead: 4, private_followup: 3, permit_path: 2, diligence: 1 };
+  const rankDiff = (landRank[b.landCheck?.landPath] || 0) - (landRank[a.landCheck?.landPath] || 0);
+  if (rankDiff) return rankDiff;
+  const verdictRank = { advance: 3, sideline: 2, watch: 2, reject: 1 };
+  const verdictDiff = (verdictRank[b.verdict] || 0) - (verdictRank[a.verdict] || 0);
+  if (verdictDiff) return verdictDiff;
+  return (b.landCheck?.combinedScore ?? b.score) - (a.landCheck?.combinedScore ?? a.score);
+}
+
+function publicNullableNumber(value) {
+  if (value === null || value === undefined || value === '') return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function publicMontanaOwnership(ownerName, propType) {
+  const text = `${ownerName || ''} ${propType || ''}`.toUpperCase();
+  if (!text.trim()) return 'unknown';
+  return /UNITED STATES|\bUSA\b|STATE OF MONTANA|MONTANA STATE|\bCOUNTY\b|\bCITY OF\b|\bTOWN OF\b|SCHOOL DISTRICT|FOREST SERVICE|BUREAU OF LAND|DEPARTMENT OF|FISH[ ,&]+WILDLIFE|TRIBAL|\bTRIBE\b|PUBLIC LAND|EXEMPT PROPERTY/.test(text) ? 'public' : 'private';
+}
+
+async function fetchOfficialLandParcels(lat, lng) {
+  const checkedAt = new Date().toISOString();
+  if (!(lat >= 44.35 && lat <= 49.01 && lng >= -116.1 && lng <= -104.0)) {
+    return { supported: false, status: 'unsupported_jurisdiction', checkedAt, parcels: [],
+      message: 'Automated parcel lookup is currently available for Montana.' };
+  }
+  const url = new URL('https://gis.dnrc.mt.gov/arcgis/rest/services/DNRALL/Cadastral/FeatureServer/0/query');
+  const params = { f: 'geojson', geometry: `${lng},${lat}`, geometryType: 'esriGeometryPoint', inSR: '4326', outSR: '4326',
+    spatialRel: 'esriSpatialRelIntersects', outFields: 'PARCELID,Geocode,GISAcres,PropType,PropAccess,OwnerName,LegalDescriptionShort,TotalLandValue,TotalValue,RefreshDate',
+    returnGeometry: 'true', resultRecordCount: '10' };
+  Object.entries(params).forEach(([key, value]) => url.searchParams.set(key, value));
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(`Montana parcel service ${response.status}`);
+  const body = await response.json();
+  if (body.error) throw new Error(body.error.message || 'Montana parcel query failed');
+  const parcels = (body.features || []).map(feature => {
+    const p = feature.properties || {}, refreshMs = Number(p.RefreshDate);
+    return { parcelId: p.PARCELID || p.Geocode || null, ownerName: p.OwnerName || null,
+      ownershipClass: publicMontanaOwnership(p.OwnerName, p.PropType), acres: publicNullableNumber(p.GISAcres),
+      propertyType: p.PropType || null, propertyAccessRecord: p.PropAccess || null,
+      legalDescriptionShort: p.LegalDescriptionShort || null, totalLandValueUsd: publicNullableNumber(p.TotalLandValue),
+      totalAssessedValueUsd: publicNullableNumber(p.TotalValue),
+      sourceUpdatedAt: Number.isFinite(refreshMs) && refreshMs > 0 ? new Date(refreshMs).toISOString() : null,
+      geometry: feature.geometry || null };
+  });
+  return { supported: true, status: parcels.length ? 'matched' : 'no_parcel_at_point', checkedAt,
+    jurisdiction: { country: 'USA', stateProvince: 'Montana' },
+    provider: { name: 'Montana DNRC Cadastral', sourceUrl: 'https://gis.dnrc.mt.gov/arcgis/rest/services/DNRALL/Cadastral/FeatureServer/0',
+      authority: 'Montana DNRC / Montana State Library', use: 'Screening only—not title, survey, availability or legal-access evidence' }, parcels };
+}
+
+async function checkMissionCandidateLand(candidateId, options = {}) {
+  if (!reconMission) return;
+  const candidate = reconMission.candidates.find(c => c.id === candidateId);
+  if (!candidate) return;
+  candidate.landCheck = { status: 'checking', checkedAt: new Date().toISOString() };
+  if (!options.silent) renderMissionCockpit();
+  try {
+    const payload = await fetchOfficialLandParcels(candidate.lat, candidate.lng);
+    if (!payload.supported) {
+      candidate.landCheck = {
+        status: payload.status || 'unsupported_jurisdiction', checkedAt: payload.checkedAt,
+        message: payload.message, provider: payload.provider || null, parcels: [], score25: 0,
+        combinedScore: Math.round(candidate.score * .75), landPath: 'unsupported', landPathLabel: 'Parcel adapter unavailable'
+      };
+    } else if (!payload.parcels?.length) {
+      candidate.landCheck = {
+        status: payload.status || 'no_parcel_at_point', checkedAt: payload.checkedAt,
+        provider: payload.provider, jurisdiction: payload.jurisdiction, parcels: [], score25: 0,
+        combinedScore: Math.round(candidate.score * .75), landPath: 'no_match', landPathLabel: 'No mapped parcel match'
+      };
+    } else {
+      const fit = scoreLandFit(candidate, payload);
+      candidate.landCheck = {
+        status: 'matched', checkedAt: payload.checkedAt, provider: payload.provider,
+        jurisdiction: payload.jurisdiction, parcels: payload.parcels.map(({ geometry, ...parcel }) => parcel),
+        ...fit, legalAccess: 'unverified', titleVerified: false, availability: 'unknown'
+      };
+      missionParcelGeometry.set(candidate.id, payload.parcels.map(p => p.geometry).filter(Boolean));
+      candidate.flags = (candidate.flags || []).filter(flag => flag !== 'parcel_status_unknown');
+      if (fit.landPath === 'permit_path' && !candidate.flags.includes('public_land_requires_permission')) candidate.flags.push('public_land_requires_permission');
+    }
+  } catch (error) {
+    candidate.landCheck = { status: 'error', checkedAt: new Date().toISOString(), error: error.message,
+      parcels: [], score25: 0, combinedScore: Math.round(candidate.score * .75), landPath: 'error', landPathLabel: 'Land check failed' };
+  }
+  reconMission.candidates.sort(missionCandidateSort);
+  saveReconMission();
+  if (!options.silent) { renderMissionCockpit(); drawMissionCandidates(); }
+  return candidate.landCheck;
+}
+
+async function checkMissionLand() {
+  if (!reconMission?.candidates?.length) { log('Run a Recon Mission first; land checks attach to ranked terrain leads.', 'warn'); return; }
+  const button = document.getElementById('missionLandBtn');
+  const queue = reconMission.candidates.filter(c => c.landCheck?.status !== 'matched').slice(0, 30);
+  if (!queue.length) { drawMissionCandidates(); log('All ranked leads already have land checks.', 'ok'); return; }
+  button.disabled = true;
+  for (let i = 0; i < queue.length; i += 3) {
+    const batch = queue.slice(i, i + 3);
+    button.textContent = `Land ${Math.min(i + batch.length, queue.length)}/${queue.length}`;
+    await Promise.all(batch.map(c => checkMissionCandidateLand(c.id, { silent: true })));
+    renderMissionCockpit(); drawMissionCandidates();
+  }
+  button.disabled = false; button.textContent = 'Check Land';
+  const matches = reconMission.candidates.filter(c => c.landCheck?.status === 'matched').length;
+  log(`Official parcel screening complete: ${matches} candidate centers matched to mapped parcels. Title, availability and legal access remain unverified.`, matches ? 'ok' : 'warn');
+}
 
 function escapeHtml(value) {
   return String(value ?? '').replace(/[&<>'"]/g, ch => ({
@@ -2280,6 +2437,7 @@ async function runMissionWorker(agentName) {
 
       let roads = [];
       try { roads = await RunEngine.fetchRoads(cell.bounds); } catch (_) {}
+      const autoLandChecks = [];
       for (const zone of local.slice(0, 3)) {
         const bestPoint = [...zone.points].sort((a, b) => b.elevation - a.elevation)[0];
         let route = null, routeFlag = null;
@@ -2328,17 +2486,22 @@ async function runMissionWorker(agentName) {
           candidate.rejectedAt = new Date().toISOString(); candidate.flags.unshift('inside_rejected_area');
         } else if (candidate.verdict === 'watch') candidate.verdict = 'sideline';
         const dupe = reconMission.candidates.find(c => missionDistanceM(c, candidate) < 750);
-        if (!dupe) reconMission.candidates.push(candidate);
-        else if (candidate.score > dupe.score || (candidate.catAccess && !dupe.catAccess)) Object.assign(dupe, candidate, { id: dupe.id });
+        if (!dupe) {
+          reconMission.candidates.push(candidate);
+          if (candidate.lat >= 44.35 && candidate.lat <= 49.01 && candidate.lng >= -116.1 && candidate.lng <= -104.0) autoLandChecks.push(candidate.id);
+        } else if (candidate.score > dupe.score || (candidate.catAccess && !dupe.catAccess)) {
+          Object.assign(dupe, candidate, { id: dupe.id });
+          if (!dupe.landCheck && dupe.lat >= 44.35 && dupe.lat <= 49.01 && dupe.lng >= -116.1 && dupe.lng <= -104.0) autoLandChecks.push(dupe.id);
+        }
       }
+      await Promise.all(autoLandChecks.map(id => checkMissionCandidateLand(id, { silent: true })));
       cell.leads = local.length;
       cell.status = 'complete';
     } catch (error) {
       cell.status = cell.attempts < 2 ? 'pending' : 'error';
       cell.rejectReason = error.message; reconMission.errors++;
     } finally {
-      const verdictRank = { advance: 3, sideline: 2, reject: 1 };
-      reconMission.candidates.sort((a, b) => (verdictRank[b.verdict] || 0) - (verdictRank[a.verdict] || 0) || b.score - a.score);
+      reconMission.candidates.sort(missionCandidateSort);
       reconMission.updatedAt = new Date().toISOString();
       saveReconMission(); renderMissionCockpit(); drawMissionCandidates();
     }
@@ -2364,6 +2527,7 @@ function clearReconMission() {
   missionStopRequested = true; missionRunning = false; missionPaused = false;
   reconMission = null; localStorage.removeItem(MISSION_KEY);
   missionLayer.clearLayers();
+  missionParcelLayer.clearLayers(); missionParcelGeometry.clear();
   document.getElementById('missionPanel').style.display = 'none';
   document.getElementById('missionLaunchBtn').disabled = false;
   document.getElementById('missionLaunchBtn').textContent = 'Launch Recon Mission';
@@ -2413,31 +2577,42 @@ function renderMissionCockpit() {
   document.getElementById('missionCells').textContent = `${terminal}/${total}`;
   document.getElementById('missionLeads').textContent = reconMission.candidates.length;
   const rejectedCandidates = reconMission.candidates.filter(c => c.verdict === 'reject').length;
+  document.getElementById('missionLand').textContent = reconMission.candidates.filter(c => c.landCheck?.status === 'matched').length;
   document.getElementById('missionRejected').textContent = reconMission.rejected + rejectedCandidates;
   document.getElementById('missionErrors').textContent = reconMission.errors;
   const active = reconMission.cells.filter(c => c.status === 'running').map(c => `${c.agent}: ${c.id}`).join(' · ');
+  const purchaseLeads = reconMission.candidates.filter(c => c.landCheck?.landPath === 'purchase_lead').length;
   document.getElementById('missionStatus').textContent = reconMission.status === 'complete'
-    ? `Complete · ${reconMission.name} · ${reconMission.candidates.length} deduplicated leads`
+    ? `Complete · ${reconMission.name} · ${reconMission.candidates.length} terrain leads · ${purchaseLeads} private purchase leads`
     : missionPaused ? 'Paused · progress saved locally' : active || 'Workers preparing next cells…';
   const reports = document.getElementById('missionReports');
-  reports.innerHTML = reconMission.candidates.slice(0, 30).map((c, i) => `
-    <div class="mission-card" onclick="map.flyTo([${c.lat},${c.lng}],13)">
-      <div style="display:flex;align-items:center;gap:5px"><b style="font-size:10px;color:#fff">#${i+1} ${c.lat.toFixed(4)}, ${c.lng.toFixed(4)}</b><span style="flex:1"></span><span class="mission-badge" style="color:${c.verdict==='advance'?'var(--green)':c.verdict==='reject'?'var(--red)':'var(--orange)'}">${c.verdict}</span><span class="badge b-purple">${c.score}</span></div>
+  reports.innerHTML = reconMission.candidates.slice(0, 30).map((c, i) => {
+    const land = c.landCheck, parcel = land?.parcels?.[0];
+    const landColor = land?.landPath === 'purchase_lead' ? 'var(--green)' : land?.landPath === 'permit_path' ? 'var(--orange)' : 'var(--cyan)';
+    const owner = parcel?.ownerName ? escapeLandText(parcel.ownerName) : null;
+    const parcelId = parcel?.parcelId ? escapeLandText(parcel.parcelId) : null;
+    const source = land?.provider?.name ? escapeLandText(land.provider.name) : null;
+    const legal = land?.status === 'matched'
+      ? `<div style="font-size:8px;color:${landColor};margin-top:5px"><b>${escapeLandText(landCheckLabel(c))}</b>${owner ? ` · ${owner}` : ''}${parcelId ? `<br>Parcel ${parcelId}` : ''}</div><div style="font-size:8px;color:var(--dim);margin-top:2px">${source || 'Official parcel source'} · boundary/owner screening only · title, sale availability, easements and legal cat access unverified</div>`
+      : `<div style="font-size:8px;color:var(--dim);margin-top:5px">${escapeLandText(landCheckLabel(c))}</div>`;
+    const score = land?.combinedScore == null ? `<span class="badge b-purple" title="Terrain and verified physical access score">${c.score}</span>` : `<span class="badge b-purple" title="Terrain + physical access + parcel screening">FIT ${land.combinedScore}</span>`;
+    return `<div class="mission-card" onclick="map.flyTo([${c.lat},${c.lng}],13)">
+      <div style="display:flex;align-items:center;gap:5px"><b style="font-size:10px;color:#fff">#${i+1} ${c.lat.toFixed(4)}, ${c.lng.toFixed(4)}</b><span style="flex:1"></span><span class="mission-badge" style="color:${c.verdict==='advance'?'var(--green)':c.verdict==='reject'?'var(--red)':'var(--orange)'}">${c.verdict}</span>${score}</div>
       <div class="run-metrics"><span class="run-metric" style="color:var(--green)">${c.verticalM}m vert</span><span class="run-metric" style="color:var(--cyan)">${c.clusterSpanM}m cluster span*</span><span class="run-metric" style="color:var(--accent)">${c.aspect}</span><span class="run-metric" style="color:var(--orange)">${c.catAccess ? 'Access '+(c.catAccess.grade||'?')+' · '+c.catAccess.distanceKm+'km / '+c.catAccess.maxSlopeDeg+'°' : 'Access U · unverified'}</span></div>
-      ${c.rejectReason ? `<div style="font-size:8px;color:${c.verdict==='reject'?'var(--red)':'var(--orange)'};margin-top:4px">${escapeHtml(c.rejectReason)}</div>` : ''}
-      <div style="display:flex;align-items:center;gap:4px;margin-top:4px"><span style="font-size:8px;color:var(--dim);flex:1">Confidence ${Math.round(c.confidence*100)}% · ${c.agent} · ${c.flags.length} open checks</span><button class="btn" onclick="sidelineMissionCandidate(event,'${c.id}')" style="font-size:8px;color:var(--orange)">Sideline</button><button class="btn" onclick="rejectMissionCandidate(event,'${c.id}')" style="font-size:8px;color:var(--red)">Reject</button></div>
-    </div>`).join('') || '<div style="font-size:9px;color:var(--dim);padding:6px">No leads yet. Workers report here as cells finish.</div>';
+      ${legal}${c.rejectReason ? `<div style="font-size:8px;color:${c.verdict==='reject'?'var(--red)':'var(--orange)'};margin-top:4px">${escapeHtml(c.rejectReason)}</div>` : ''}<div style="display:flex;align-items:center;gap:4px;margin-top:5px"><span style="font-size:8px;color:var(--dim);flex:1">Confidence ${Math.round(c.confidence*100)}% · ${c.agent} · ${c.flags.length} open checks</span><button class="btn" onclick="event.stopPropagation();checkMissionCandidateLand('${c.id}')" style="font-size:8px;color:var(--cyan)">${land ? 'Recheck land' : 'Check land'}</button><button class="btn" onclick="sidelineMissionCandidate(event,'${c.id}')" style="font-size:8px;color:var(--orange)">Sideline</button><button class="btn" onclick="rejectMissionCandidate(event,'${c.id}')" style="font-size:8px;color:var(--red)">Reject</button></div></div>`;
+  }).join('') || '<div style="font-size:9px;color:var(--dim);padding:6px">No leads yet. Workers report here as cells finish.</div>';
 }
 
 function drawMissionCandidates() {
   missionLayer.clearLayers();
+  missionParcelLayer.clearLayers();
   if (!reconMission) return;
   reconMission.candidates.slice(0, 30).forEach((c, i) => {
     const color = c.verdict === 'advance' ? '#a855f7' : c.verdict === 'reject' ? '#ef4444' : '#f59e0b';
     if (c.footprint && c.footprint.length >= 3) {
       const hull = convexHull(c.footprint);
       L.polygon(hull, { color, weight: 2.5, fillColor: color, fillOpacity: .16, dashArray: c.verdict === 'advance' ? null : '6 4' })
-        .bindPopup(`<b>Recon lead #${i+1}</b><br>${c.verticalM}m vert · ${c.aspect}<br>${c.catAccess ? 'Access '+(c.catAccess.grade||'?')+' · '+c.catAccess.distanceKm+'km' : 'Access unverified'}<br><small>Approximate sampled terrain footprint—not a parcel boundary.</small>`)
+        .bindPopup(`<b>Recon lead #${i+1}</b><br>${c.verticalM}m vert · ${c.aspect}<br>${c.catAccess ? 'Access '+(c.catAccess.grade||'?')+' · '+c.catAccess.distanceKm+'km' : 'Access unverified'}<br>${escapeLandText(landCheckLabel(c))}<br><small>Colored terrain footprint is not a parcel boundary.</small>`)
         .addTo(missionLayer);
     } else {
       L.circle([c.lat, c.lng], { radius: Math.min(1800, Math.max(450, (c.clusterSpanM || 900) / 3)), color, weight: 2, fillColor: color, fillOpacity: .12 })
@@ -2446,6 +2621,14 @@ function drawMissionCandidates() {
     L.circleMarker([c.lat, c.lng], { radius: 6, color, weight: 2, fillColor: color, fillOpacity: .35 })
       .bindPopup(`<b>Recon lead #${i+1}</b><br>${c.verticalM}m vert · ${c.aspect}<br>${c.catAccess ? 'Access '+(c.catAccess.grade||'?')+' · '+c.catAccess.distanceKm+'km cat route' : 'Access U · unverified'}<br><small>${c.flags.length} open checks</small>`)
       .addTo(missionLayer);
+    const geometries = missionParcelGeometry.get(c.id) || [];
+    geometries.forEach(geometry => {
+      const parcel = c.landCheck?.parcels?.[0] || {};
+      const fill = parcel.ownershipClass === 'private' ? '#06b6d4' : parcel.ownershipClass === 'public' ? '#ef4444' : '#94a3b8';
+      L.geoJSON({ type: 'Feature', geometry, properties: {} }, { style: { color: '#67e8f9', weight: 3, fillColor: fill, fillOpacity: .18, dashArray: '5 3' } })
+        .bindPopup(`<b>Official mapped parcel</b><br>${escapeLandText(parcel.ownerName || 'Owner unavailable')}<br>${parcel.acres == null ? 'Acreage unavailable' : parcel.acres.toFixed(1)+' acres'}<br><small>${escapeLandText(c.landCheck?.provider?.name || '')}<br>Not proof of title, availability or legal access.</small>`)
+        .addTo(missionParcelLayer);
+    });
   });
   (reconMission.exclusions || []).forEach(x => {
     const b=x.bounds;

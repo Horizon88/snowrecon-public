@@ -16,4 +16,4 @@ North American Recon Mission candidates can be matched to official parcel data w
 
 ## Evidence labels
 
-Recon mission cards describe the stored qualifying sample count, terrain completeness and modeled cat-route status. A modeled route does not establish legal access. Fixed confidence percentages are no longer generated or displayed; legacy confidence fields remain untouched in saved records and JSON exports. Missing completeness information on older records is shown as unknown.
+Recon mission cards describe the stored qualifying sample count, terrain completeness and modeled cat-route status. A modeled route does not establish legal access. Fixed confidence percentages are no longer generated or displayed; legacy confidence fields remain untouched in saved mission data in browser storage. Missing completeness information on older records is shown as unknown.

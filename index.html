@@ -2574,7 +2574,7 @@ function sidelineMissionCandidate(event, id) {
 function missionEvidenceSummary(candidate) {
   const count = candidate.qualifyingSamples;
   const samples = Number.isInteger(count) && count >= 0
-    ? `${count} qualifying terrain samples` : 'Terrain sample count unknown';
+    ? `${count} qualifying terrain sample${count === 1 ? "" : "s"}` : 'Terrain sample count unknown';
   const incomplete = candidate.terrainReviewStatus === 'data_review'
     || (Array.isArray(candidate.flags) && candidate.flags.includes('terrain_coverage_incomplete'));
   const coverage = incomplete ? 'terrain data incomplete'
@@ -2616,7 +2616,7 @@ function renderMissionCockpit() {
     return `<div class="mission-card" onclick="map.flyTo([${c.lat},${c.lng}],13)">
       <div style="display:flex;align-items:center;gap:5px"><b style="font-size:10px;color:#fff">#${i+1} ${c.lat.toFixed(4)}, ${c.lng.toFixed(4)}</b><span style="flex:1"></span><span class="mission-badge" style="color:${c.verdict==='advance'?'var(--green)':c.verdict==='reject'?'var(--red)':'var(--orange)'}">${c.verdict}</span>${score}</div>
       <div class="run-metrics"><span class="run-metric" style="color:var(--green)">${c.verticalM}m vert</span><span class="run-metric" style="color:var(--cyan)">${c.clusterSpanM}m cluster span*</span><span class="run-metric" style="color:var(--accent)">${c.aspect}</span><span class="run-metric" style="color:var(--orange)">${c.catAccess ? 'Access '+(c.catAccess.grade||'?')+' · '+c.catAccess.distanceKm+'km / '+c.catAccess.maxSlopeDeg+'°' : 'Access U · unverified'}</span></div>
-      ${legal}${c.rejectReason ? `<div style="font-size:8px;color:${c.verdict==='reject'?'var(--red)':'var(--orange)'};margin-top:4px">${escapeHtml(c.rejectReason)}</div>` : ''}<div style="display:flex;align-items:center;gap:4px;margin-top:5px"><span style="font-size:8px;color:var(--dim);flex:1">${escapeHtml(missionEvidenceSummary(c))} · ${c.agent} · ${c.flags.length} open checks</span><button class="btn" onclick="event.stopPropagation();checkMissionCandidateLand('${c.id}')" style="font-size:8px;color:var(--cyan)">${land ? 'Recheck land' : 'Check land'}</button><button class="btn" onclick="sidelineMissionCandidate(event,'${c.id}')" style="font-size:8px;color:var(--orange)">Sideline</button><button class="btn" onclick="rejectMissionCandidate(event,'${c.id}')" style="font-size:8px;color:var(--red)">Reject</button></div></div>`;
+      ${legal}${c.rejectReason ? `<div style="font-size:8px;color:${c.verdict==='reject'?'var(--red)':'var(--orange)'};margin-top:4px">${escapeHtml(c.rejectReason)}</div>` : ''}<div style="font-size:10px;line-height:1.5;color:var(--dim);margin-top:5px">${escapeHtml(missionEvidenceSummary(c))}</div><div style="display:flex;align-items:center;gap:4px;margin-top:5px"><span style="font-size:8px;color:var(--dim);flex:1">${c.agent} · ${c.flags.length} open checks</span><button class="btn" onclick="event.stopPropagation();checkMissionCandidateLand('${c.id}')" style="font-size:8px;color:var(--cyan)">${land ? 'Recheck land' : 'Check land'}</button><button class="btn" onclick="sidelineMissionCandidate(event,'${c.id}')" style="font-size:8px;color:var(--orange)">Sideline</button><button class="btn" onclick="rejectMissionCandidate(event,'${c.id}')" style="font-size:8px;color:var(--red)">Reject</button></div></div>`;
   }).join('') || '<div style="font-size:9px;color:var(--dim);padding:6px">No leads yet. Workers report here as cells finish.</div>';
 }
 

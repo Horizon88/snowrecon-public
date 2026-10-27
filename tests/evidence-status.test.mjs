@@ -41,6 +41,7 @@ test('an incomplete coverage flag takes precedence over a completed screen', () 
 });
 
 test('missing or invalid stored values stay unknown', () => {
+  assert.match(summarize({qualifyingSamples: 1}), /1 qualifying terrain sample ·/);
   for (const count of [undefined, null, -1, NaN, '5', 1.5]) {
     assert.match(summarize({qualifyingSamples: count}), /sample count unknown/);
   }
@@ -52,7 +53,7 @@ test('missing or invalid stored values stay unknown', () => {
 
 test('cards use escaped evidence labels and no new fixed confidence is assigned', () => {
   assert.ok(html.includes('${escapeHtml(missionEvidenceSummary(c))}'));
-  assert.doesNotMatch(html, /confidence:\s*route\s*\?|Confidence \$\{/);
+  assert.doesNotMatch(html, /confidence\s*:|Confidence \$\{/);
 });
 
 test('all inline JavaScript parses', () => {

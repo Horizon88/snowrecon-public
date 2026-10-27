@@ -2158,6 +2158,7 @@ const missionLandRequests = new WeakMap();
 let missionLandBatch = null;
 let missionActiveRaw = null;
 let missionExportedArchives = null;
+let missionExportedActive = null;
 
 function escapeLandText(value) {
   return String(value == null ? '' : value).replace(/[&<>'"]/g, ch => ({
@@ -2510,7 +2511,23 @@ function archiveReconMission(reason) {
     localStorage.setItem(key, raw);
     if (localStorage.getItem(key) !== raw) throw new Error('History write was not retained');
     return true;
-  } catch (_) { showMissionHistoryError(); return false; }
+  } catch (_) {
+    showMissionHistoryError();
+    return confirmExportedMissionFallback();
+  }
+}
+
+function confirmExportedMissionFallback() {
+  // An export can serve as the only archive only after a failed browser archive
+  // write, with exact proof that neither RAM nor stored ACTIVE changed since it.
+  try {
+    const proof = missionExportedActive;
+    const storedRaw = localStorage.getItem(MISSION_KEY) ?? null;
+    const activeRaw = reconMission ? null : (missionActiveRaw ?? storedRaw);
+    if (!proof || proof.snapshot !== JSON.stringify(reconMission)
+        || proof.activeRaw !== activeRaw || proof.storedRaw !== storedRaw) return false;
+    return confirm('Browser storage could not save a mission archive. Have you saved and opened the exported history file? Continue using that downloaded file as the ONLY archive of this exact mission? Clearing or replacing it will remove it from this browser. Cancel if the file is not safely saved.');
+  } catch (_) { return false; }
 }
 
 function missionHistoryExport() {
@@ -2519,16 +2536,20 @@ function missionHistoryExport() {
     .map(({ key }) => ({ key, raw: localStorage.getItem(key) }));
   return { version: 1, exportedAt: new Date().toISOString(), ...history, archiveRaw,
     active: reconMission ? JSON.parse(JSON.stringify(reconMission)) : null,
+    activeStoredRaw: localStorage.getItem(MISSION_KEY) ?? null,
     activeRaw: reconMission ? null : (missionActiveRaw ?? localStorage.getItem(MISSION_KEY) ?? null) };
 }
 
 function exportMissionHistory() {
+  missionExportedActive = null;
+  missionExportedArchives = null;
   try {
     const data = missionHistoryExport();
     const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a'); a.href = url; a.download = 'snowrecon-mission-history.json'; a.click();
     missionExportedArchives = data.archiveRaw;
+    missionExportedActive = { snapshot: JSON.stringify(data.active), activeRaw: data.activeRaw, storedRaw: data.activeStoredRaw };
     setTimeout(() => URL.revokeObjectURL(url), 1000);
   } catch (_) {
     showMissionStorageWarning('Mission history could not be exported; saved records are unchanged.');

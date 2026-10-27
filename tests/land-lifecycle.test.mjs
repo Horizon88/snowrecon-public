@@ -16,7 +16,7 @@ function setup(candidates,fetcher=()=>{throw Error('unexpected fetch');}) {
   const layer=()=>({clearLayers(){}});
   const shape=(type,args)=>{const record={type,args};shapes.push(record);return{
     bindPopup(popup){record.popup=popup;return this;},addTo(){return this;}};};
-  const context=vm.createContext({MISSION_KEY:'mission',reconMission:null,missionActiveRaw:null,missionExportedArchives:null,missionStopRequested:false,missionPaused:false,missionRunning:false,missionParcelGeometry:new Map(),missionLandRequests:new WeakMap(),missionLandBatch:null,
+  const context=vm.createContext({MISSION_KEY:'mission',reconMission:null,missionActiveRaw:null,missionExportedArchives:null,missionExportedActive:null,missionStopRequested:false,missionPaused:false,missionRunning:false,missionParcelGeometry:new Map(),missionLandRequests:new WeakMap(),missionLandBatch:null,
     Blob,URL:{createObjectURL:()=> 'blob:test',revokeObjectURL(){}},setTimeout:()=>{},confirm:()=>false,
     document:{createElement:()=>({click(){}}),getElementById:id=>{if(!elements.has(id))elements.set(id,{style:{},innerHTML:'',textContent:''});return elements.get(id);}},
     localStorage:{get length(){return stored.size;},key:i=>[...stored.keys()][i]??null,getItem:key=>stored.get(key),setItem:(key,value)=>{stored.set(key,value);saves.push(JSON.parse(value));},removeItem:key=>stored.delete(key)},
@@ -497,7 +497,7 @@ test('successful replacement archive followed by ACTIVE quota failure retains bo
   s.context.renderMissionCockpit();assert.equal(s.elements.get('missionStorageWarning').style.display,'block');
 });
 
-for(const raw of ['{broken','42','true','[]','"text"','{}','{"cells":[],"candidates":[null]}','{"cells":[],"candidates":[],"exclusions":{}}']) {
+for(const raw of ['{broken','null','42','true','[]','"text"','{}','{"cells":[],"candidates":[null]}','{"cells":[],"candidates":[],"exclusions":{}}']) {
   for(const action of ['clear','launch'])test(`unreadable ACTIVE ${raw} survives actual load, export and ${action}`,async()=>{
     const s=setup([]);s.stored.set('mission',raw);assert.doesNotThrow(()=>s.load());
     assert.equal(s.context.reconMission,null);assert.equal(s.stored.get('mission'),raw);
@@ -581,4 +581,34 @@ test('actual launched workers settle after save failure without overlapping repl
   assert.equal(mission.cells.filter(c=>c.status==='rejected').length,2);
   s.context.localStorage.setItem=set;assert.equal(s.context.saveReconMission(),true);
   assert.equal(s.elements.get('missionStorageWarning').style.display,'none');assert.equal(s.saved().status,'stopped');
+});
+
+for(const action of ['clear','launch'])for(const malformed of [false,true])test(`first-archive quota permits explicitly confirmed exported-only ${action} (${malformed?'raw':'mission'})`,async()=>{
+  const s=setup([lead('large',{manualReviewHistory:[{decision:{reason:'Original review'}}]})]);
+  if(malformed)s.stored.set('mission','{ unparsed original\n');s.load();installClear(s);const finish=installLaunch(s);
+  const before=s.stored.get('mission'),snapshot=clone(s.context.reconMission);let exported,confirmation;
+  s.context.URL.createObjectURL=blob=>{exported=blob;return 'blob:export';};s.context.exportMissionHistory();
+  const exportedData=JSON.parse(await exported.text());assert.equal(exportedData.activeStoredRaw,before);assert.deepEqual(exportedData.active,snapshot);
+  const set=s.context.localStorage.setItem;s.context.localStorage.setItem=(key,value)=>{if(key.startsWith(historyKey))throw Error('first archive quota');set(key,value);};
+  s.context.confirm=message=>{confirmation=message;return false;};
+  if(action==='clear')s.context.clearReconMission();else await s.context.launchReconMission();
+  assert.equal(s.stored.get('mission'),before);assert.equal(archived(s).length,0);assert.match(confirmation,/saved and opened/);assert.match(confirmation,/ONLY archive/);
+  s.context.confirm=()=>true;
+  if(action==='clear')s.context.clearReconMission();else{const pending=s.context.launchReconMission();finish();await pending;}
+  assert.equal(archived(s).length,0);
+  if(action==='clear'){assert.equal(s.context.reconMission,null);assert.equal(s.stored.has('mission'),false);}
+  else{assert.equal(s.saved().status,'complete');assert.notEqual(s.stored.get('mission'),before);}
+  assert.equal(exportedData.activeStoredRaw,before);assert.deepEqual(exportedData.active,snapshot);
+});
+
+for(const change of ['ram','stored','raw','failed-export'])test(`export-only archive fallback stays blocked after ${change} changes`,()=>{
+  const s=setup([lead('kept')]);if(change==='raw')s.stored.set('mission','{broken');s.load();installClear(s);
+  s.context.exportMissionHistory();
+  if(change==='ram')s.context.reconMission.candidates[0].manualReviewHistory=[{decision:{reason:'New unexported review'}}];
+  if(change==='stored')s.stored.set('mission',s.stored.get('mission')+' ');
+  if(change==='raw'){s.context.missionActiveRaw='{new unexported raw';s.stored.set('mission',s.context.missionActiveRaw);}
+  if(change==='failed-export'){s.context.URL.createObjectURL=()=>{throw Error('download failed');};s.context.exportMissionHistory();}
+  const before=s.stored.get('mission'),live=s.context.reconMission;let confirmations=0;s.context.confirm=()=>{confirmations++;return true;};
+  s.context.localStorage.setItem=()=>{throw Error('quota');};s.context.clearReconMission();
+  assert.equal(confirmations,0);assert.equal(s.stored.get('mission'),before);assert.equal(s.context.reconMission,live);assert.equal(archived(s).length,0);
 });

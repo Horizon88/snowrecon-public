@@ -7,7 +7,7 @@ const html = fs.readFileSync(new URL('../index.html', import.meta.url), 'utf8');
 const start = html.indexOf('function replaceMissionCandidateEvidence(');
 const end = html.indexOf('\nfunction renderMissionCockpit()', start);
 assert.ok(start >= 0 && end > start);
-const context = vm.createContext({});
+const context = vm.createContext({missionParcelGeometry: new Map()});
 vm.runInContext(html.slice(start, end), context);
 const summarize = context.missionEvidenceSummary;
 const replaceEvidence = context.replaceMissionCandidateEvidence;

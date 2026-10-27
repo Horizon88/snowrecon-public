@@ -2245,22 +2245,36 @@ async function fetchOfficialLandParcels(lat, lng) {
 }
 
 async function checkMissionCandidateLand(candidateId, options = {}) {
-  if (!reconMission) return;
-  const candidate = reconMission.candidates.find(c => c.id === candidateId);
+  const mission = reconMission;
+  if (!mission) return;
+  const candidate = mission.candidates.find(c => c.id === candidateId);
   if (!candidate) return;
-  candidate.landCheck = { status: 'checking', checkedAt: new Date().toISOString() };
+  const queryPosition = { lat: candidate.lat, lng: candidate.lng };
+  if (candidate.landCheck) {
+    candidate.landCheckHistory ||= [];
+    candidate.landCheckHistory.push(JSON.parse(JSON.stringify(candidate.landCheck)));
+  }
+  const pending = { status: 'checking', checkedAt: new Date().toISOString(), queryPosition };
+  candidate.landCheck = pending;
+  missionParcelGeometry.delete(candidate.id);
+  candidate.flags = (candidate.flags || []).filter(flag => flag !== 'public_land_requires_permission');
+  if (!candidate.flags.includes('parcel_status_unknown')) candidate.flags.push('parcel_status_unknown');
+  const isCurrent = () => reconMission === mission && mission.candidates.includes(candidate)
+    && candidate.lat === queryPosition.lat && candidate.lng === queryPosition.lng
+    && candidate.landCheck === pending;
   if (!options.silent) renderMissionCockpit();
   try {
-    const payload = await fetchOfficialLandParcels(candidate.lat, candidate.lng);
+    const payload = await fetchOfficialLandParcels(queryPosition.lat, queryPosition.lng);
+    if (!isCurrent()) return null;
     if (!payload.supported) {
       candidate.landCheck = {
-        status: payload.status || 'unsupported_jurisdiction', checkedAt: payload.checkedAt,
+        status: payload.status || 'unsupported_jurisdiction', checkedAt: payload.checkedAt, queryPosition,
         message: payload.message, provider: payload.provider || null, parcels: [], score25: 0,
         combinedScore: Math.round(candidate.score * .75), landPath: 'unsupported', landPathLabel: 'Parcel adapter unavailable'
       };
     } else if (!payload.parcels?.length) {
       candidate.landCheck = {
-        status: payload.status || 'no_parcel_at_point', checkedAt: payload.checkedAt,
+        status: payload.status || 'no_parcel_at_point', checkedAt: payload.checkedAt, queryPosition,
         provider: payload.provider, jurisdiction: payload.jurisdiction, parcels: [], score25: 0,
         combinedScore: Math.round(candidate.score * .75), landPath: 'no_match', landPathLabel: 'No mapped parcel match'
       };
@@ -2269,17 +2283,18 @@ async function checkMissionCandidateLand(candidateId, options = {}) {
       candidate.landCheck = {
         status: 'matched', checkedAt: payload.checkedAt, provider: payload.provider,
         jurisdiction: payload.jurisdiction, parcels: payload.parcels.map(({ geometry, ...parcel }) => parcel),
-        ...fit, legalAccess: 'unverified', titleVerified: false, availability: 'unknown'
+        ...fit, queryPosition, legalAccess: 'unverified', titleVerified: false, availability: 'unknown'
       };
       missionParcelGeometry.set(candidate.id, payload.parcels.map(p => p.geometry).filter(Boolean));
-      candidate.flags = (candidate.flags || []).filter(flag => flag !== 'parcel_status_unknown');
+      candidate.flags = candidate.flags.filter(flag => flag !== 'parcel_status_unknown');
       if (fit.landPath === 'permit_path' && !candidate.flags.includes('public_land_requires_permission')) candidate.flags.push('public_land_requires_permission');
     }
   } catch (error) {
-    candidate.landCheck = { status: 'error', checkedAt: new Date().toISOString(), error: error.message,
+    if (!isCurrent()) return null;
+    candidate.landCheck = { status: 'error', checkedAt: new Date().toISOString(), queryPosition, error: error.message,
       parcels: [], score25: 0, combinedScore: Math.round(candidate.score * .75), landPath: 'error', landPathLabel: 'Land check failed' };
   }
-  reconMission.candidates.sort(missionCandidateSort);
+  mission.candidates.sort(missionCandidateSort);
   saveReconMission();
   if (!options.silent) { renderMissionCockpit(); drawMissionCandidates(); }
   return candidate.landCheck;
@@ -2585,6 +2600,13 @@ function replaceMissionCandidateEvidence(existing, candidate) {
     ? candidate.terrainReviewStatus : 'unknown';
   Object.assign(existing, candidate, { id: existing.id, terrainReviewStatus, terrainReviewHistory: history }, savedReview);
   existing.flags = Array.isArray(existing.flags) ? [...existing.flags] : [];
+  if (existing.lat !== priorRecord.lat || existing.lng !== priorRecord.lng) {
+    // The full old match and query remain in the detached evidence snapshot.
+    delete existing.landCheck;
+    missionParcelGeometry.delete(existing.id);
+    existing.flags = existing.flags.filter(flag => flag !== 'public_land_requires_permission');
+    if (!existing.flags.includes('parcel_status_unknown')) existing.flags.push('parcel_status_unknown');
+  }
   if (savedReview.verdict === 'reject' && priorRecord.flags?.includes('inside_rejected_area')
     && !existing.flags.includes('inside_rejected_area')) existing.flags.unshift('inside_rejected_area');
   if (existing.landCheck?.status === 'matched') {

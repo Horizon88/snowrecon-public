@@ -90,7 +90,7 @@ test('replacement retains complete prior evidence without recursively nesting hi
 
 test('retained exclusions and matched land evidence keep their explanatory flags', () => {
   const existing = {id: 'kept', verdict: 'reject', flags: ['inside_rejected_area'],
-    landCheck: {status: 'matched', landPath: 'permit_path'}};
+    landCheck: {status: 'matched', landPath: 'permit_path', parcels: [{parcelId: 'retained-public'}]}};
   replaceEvidence(existing, {verdict: 'reject', rejectReason: 'new exclusion reason',
     rejectedAt: 'today', flags: ['parcel_status_unknown', 'legal_access_unverified']});
   assert.equal(existing.rejectReason, 'new exclusion reason');

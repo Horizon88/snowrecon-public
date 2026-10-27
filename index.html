@@ -2164,15 +2164,16 @@ function landCheckLabel(candidate) {
   if (land.status === 'no_parcel_at_point') return 'No mapped parcel at candidate center';
   if (land.status === 'error') return `Land check error: ${land.error || 'retry'}`;
   if (land.status !== 'matched') return 'Land status unknown';
-  const p = land.parcels[0] || {};
-  const acres = p.acres == null ? 'acreage unknown' : `${p.acres.toFixed(0)} ac`;
-  return `${land.landPathLabel} · ${acres}`;
+  const p = firstMissionParcel(land);
+  if (!p) return 'Parcel evidence incomplete · recheck needed';
+  const acres = Number.isFinite(p.acres) && p.acres >= 0 ? `${p.acres.toFixed(0)} ac` : 'acreage unknown';
+  return `${land.landPathLabel || 'Ownership diligence'} · ${acres}`;
 }
 
 function scoreLandFit(candidate, payload) {
-  const parcel = payload.parcels[0];
-  if (!parcel) return { score25: 0, combinedScore: Math.round(candidate.score * .75), landPath: 'no_match', landPathLabel: 'No parcel match' };
-  const acres = Math.max(0, parcel.acres || 0);
+  const parcel = firstMissionParcel(payload);
+  if (!parcel) return { score25: null, combinedScore: null, landPath: 'unknown', landPathLabel: 'Parcel evidence incomplete' };
+  const acres = Number.isFinite(parcel.acres) ? Math.max(0, parcel.acres) : 0;
   const ownershipPts = parcel.ownershipClass === 'private' ? 15 : parcel.ownershipClass === 'public' ? 4 : 2;
   const acreagePts = Math.min(10, acres / 16);
   const score25 = Math.round(Math.min(25, ownershipPts + acreagePts));
@@ -2189,16 +2190,29 @@ function scoreLandFit(candidate, payload) {
   return { score25, combinedScore: Math.round(candidate.score * .75 + score25), landPath, landPathLabel };
 }
 
+function firstMissionParcel(land) {
+  const parcel = Array.isArray(land?.parcels) ? land.parcels[0] : null;
+  return parcel && typeof parcel === 'object' && !Array.isArray(parcel) && Object.keys(parcel).length ? parcel : null;
+}
+
+// A persisted matched marker is insufficient without its underlying parcel record.
+// Keep old source/fit fields intact, but never use that incomplete fit as current evidence.
+function currentMissionLandFit(candidate) {
+  const land = candidate.landCheck;
+  return land?.status === 'matched' && !firstMissionParcel(land) ? null : land;
+}
+
 function missionCandidateSort(a, b) {
   if (a.verdict === 'reject' && b.verdict !== 'reject') return 1;
   if (b.verdict === 'reject' && a.verdict !== 'reject') return -1;
   const landRank = { purchase_lead: 4, private_followup: 3, permit_path: 2, diligence: 1 };
-  const rankDiff = (landRank[b.landCheck?.landPath] || 0) - (landRank[a.landCheck?.landPath] || 0);
+  const aFit = currentMissionLandFit(a), bFit = currentMissionLandFit(b);
+  const rankDiff = (landRank[bFit?.landPath] || 0) - (landRank[aFit?.landPath] || 0);
   if (rankDiff) return rankDiff;
   const verdictRank = { advance: 3, sideline: 2, watch: 2, reject: 1 };
   const verdictDiff = (verdictRank[b.verdict] || 0) - (verdictRank[a.verdict] || 0);
   if (verdictDiff) return verdictDiff;
-  return (b.landCheck?.combinedScore ?? b.score) - (a.landCheck?.combinedScore ?? a.score);
+  return (bFit?.combinedScore ?? b.score) - (aFit?.combinedScore ?? a.score);
 }
 
 function publicNullableNumber(value) {
@@ -2654,10 +2668,13 @@ function replaceMissionCandidateEvidence(existing, candidate) {
     if (flag && !existing.flags.includes(flag)) existing.flags.unshift(flag);
   }
   refreshMissionLandFit(existing);
-  if (existing.landCheck?.status === 'matched') {
+  if (existing.landCheck?.status === 'matched' && firstMissionParcel(existing.landCheck)) {
     existing.flags = existing.flags.filter(flag => flag !== 'parcel_status_unknown' && flag !== 'public_land_requires_permission');
     if (existing.landCheck.landPath === 'permit_path' && !existing.flags.includes('public_land_requires_permission'))
       existing.flags.push('public_land_requires_permission');
+  } else if (existing.landCheck?.status === 'matched') {
+    existing.flags = existing.flags.filter(flag => flag !== 'public_land_requires_permission');
+    if (!existing.flags.includes('parcel_status_unknown')) existing.flags.push('parcel_status_unknown');
   }
   return existing;
 }
@@ -2665,9 +2682,15 @@ function replaceMissionCandidateEvidence(existing, candidate) {
 // Re-score existing source facts against the latest terrain without redating the source.
 function refreshMissionLandFit(candidate) {
   const land = candidate.landCheck;
-  if (!land || !Number.isFinite(candidate.score)) return;
-  if (land.status === 'matched' && Array.isArray(land.parcels) && land.parcels.length) {
+  if (!land) return;
+  if (land.status === 'matched' && !firstMissionParcel(land)) {
+    land.fitStatus = 'incomplete_parcel_evidence';
+    return;
+  }
+  if (!Number.isFinite(candidate.score)) return;
+  if (land.status === 'matched') {
     Object.assign(land, scoreLandFit(candidate, land), { fitUpdatedAt: new Date().toISOString() });
+    delete land.fitStatus;
   } else if (['no_parcel_at_point', 'unsupported_jurisdiction', 'error'].includes(land.status)) {
     land.combinedScore = Math.round(candidate.score * .75);
     land.fitUpdatedAt = new Date().toISOString();
@@ -2707,25 +2730,25 @@ function renderMissionCockpit() {
   document.getElementById('missionCells').textContent = `${terminal}/${total}`;
   document.getElementById('missionLeads').textContent = reconMission.candidates.length;
   const rejectedCandidates = reconMission.candidates.filter(c => c.verdict === 'reject').length;
-  document.getElementById('missionLand').textContent = reconMission.candidates.filter(c => c.landCheck?.status === 'matched').length;
+  document.getElementById('missionLand').textContent = reconMission.candidates.filter(c => c.landCheck?.status === 'matched' && firstMissionParcel(c.landCheck)).length;
   document.getElementById('missionRejected').textContent = reconMission.rejected + rejectedCandidates;
   document.getElementById('missionErrors').textContent = reconMission.errors;
   const active = reconMission.cells.filter(c => c.status === 'running').map(c => `${c.agent}: ${c.id}`).join(' · ');
-  const purchaseLeads = reconMission.candidates.filter(c => c.landCheck?.landPath === 'purchase_lead').length;
+  const purchaseLeads = reconMission.candidates.filter(c => currentMissionLandFit(c)?.landPath === 'purchase_lead').length;
   document.getElementById('missionStatus').textContent = reconMission.status === 'complete'
     ? `Complete · ${reconMission.name} · ${reconMission.candidates.length} terrain leads · ${purchaseLeads} private purchase leads`
     : missionPaused ? 'Paused · progress saved locally' : active || 'Workers preparing next cells…';
   const reports = document.getElementById('missionReports');
   reports.innerHTML = reconMission.candidates.slice(0, 30).map((c, i) => {
-    const land = c.landCheck, parcel = land?.parcels?.[0];
-    const landColor = land?.landPath === 'purchase_lead' ? 'var(--green)' : land?.landPath === 'permit_path' ? 'var(--orange)' : 'var(--cyan)';
+    const land = c.landCheck, fit = currentMissionLandFit(c), parcel = firstMissionParcel(land);
+    const landColor = fit?.landPath === 'purchase_lead' ? 'var(--green)' : fit?.landPath === 'permit_path' ? 'var(--orange)' : 'var(--cyan)';
     const owner = parcel?.ownerName ? escapeLandText(parcel.ownerName) : null;
     const parcelId = parcel?.parcelId ? escapeLandText(parcel.parcelId) : null;
     const source = land?.provider?.name ? escapeLandText(land.provider.name) : null;
-    const legal = land?.status === 'matched'
+    const legal = land?.status === 'matched' && parcel
       ? `<div style="font-size:8px;color:${landColor};margin-top:5px"><b>${escapeLandText(landCheckLabel(c))}</b>${owner ? ` · ${owner}` : ''}${parcelId ? `<br>Parcel ${parcelId}` : ''}</div><div style="font-size:8px;color:var(--dim);margin-top:2px">${source || 'Official parcel source'} · boundary/owner screening only · title, sale availability, easements and legal cat access unverified</div>`
       : `<div style="font-size:8px;color:var(--dim);margin-top:5px">${escapeLandText(landCheckLabel(c))}</div>`;
-    const score = land?.combinedScore == null ? `<span class="badge b-purple" title="Terrain and verified physical access score">${c.score}</span>` : `<span class="badge b-purple" title="Terrain + physical access + parcel screening">FIT ${land.combinedScore}</span>`;
+    const score = fit?.combinedScore == null ? `<span class="badge b-purple" title="Terrain and verified physical access score">${c.score}</span>` : `<span class="badge b-purple" title="Terrain + physical access + parcel screening">FIT ${fit.combinedScore}</span>`;
     return `<div class="mission-card" onclick="map.flyTo([${c.lat},${c.lng}],13)">
       <div style="display:flex;align-items:center;gap:5px"><b style="font-size:10px;color:#fff">#${i+1} ${c.lat.toFixed(4)}, ${c.lng.toFixed(4)}</b><span style="flex:1"></span><span class="mission-badge" style="color:${c.verdict==='advance'?'var(--green)':c.verdict==='reject'?'var(--red)':'var(--orange)'}">${c.verdict}</span>${score}</div>
       <div class="run-metrics"><span class="run-metric" style="color:var(--green)">${c.verticalM}m vert</span><span class="run-metric" style="color:var(--cyan)">${c.clusterSpanM}m cluster span*</span><span class="run-metric" style="color:var(--accent)">${c.aspect}</span><span class="run-metric" style="color:var(--orange)">${c.catAccess ? 'Access '+(c.catAccess.grade||'?')+' · '+c.catAccess.distanceKm+'km / '+c.catAccess.maxSlopeDeg+'°' : 'Access U · unverified'}</span></div>

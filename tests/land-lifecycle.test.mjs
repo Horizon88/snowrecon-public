@@ -410,3 +410,24 @@ test('resumed actual workers scan only unfinished cells without resetting comple
   assert.equal(cells[0].attempts,1);assert.equal(cells[1].attempts,1);assert.equal(cells[2].attempts,2);
   assert.deepEqual(s.saved().candidates,[c]);assert.equal(s.saved().status,'complete');
 });
+
+
+for(const persistedStatus of ['running','paused']) test(`reload ${persistedStatus} cannot discard saved evidence on a different-region launch`,async()=>{
+  const c=lead('saved',{landCheck:validLand('saved-source'),manualReviewHistory:[{decision:{reason:'Keep'}}]});
+  const s=setup([c]);s.load();Object.assign(s.context.reconMission,{status:persistedStatus,cellKm:12,minElevation:700});
+  s.context.saveReconMission();s.load();assert.equal(s.context.reconMission.status,'paused');
+  const mission=s.context.reconMission,before=s.stored.get('mission'),saves=s.saves.length;
+  installLaunch(s);s.context.currentRegion='japan';let workers=0;s.context.runMissionWorker=async()=>{workers++;};
+  await s.context.launchReconMission();
+  assert.equal(s.context.reconMission,mission);assert.equal(workers,0);assert.equal(mission.status,'paused');
+  assert.equal(s.stored.get('mission'),before);assert.equal(s.saves.length,saves);
+  assert.match(s.elements.get('missionStatus').textContent,/saved mission region.*USA/);
+});
+
+test('reload labels stopped and paused saved missions as resumable',()=>{
+  for(const status of ['stopped','paused']){
+    const s=setup([lead('saved')]);s.load();Object.assign(s.context.reconMission,{status,cellKm:12});
+    s.context.saveReconMission();s.context.document.getElementById('missionLaunchBtn').textContent='Launch Recon Mission';s.load();
+    assert.equal(s.elements.get('missionLaunchBtn').textContent,'Resume Mission');
+  }
+});

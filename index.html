@@ -2462,6 +2462,7 @@ function loadReconMission() {
     });
     reconMission.candidates.sort(missionCandidateSort);
     document.getElementById('missionPanel').style.display = 'block';
+    document.getElementById('missionLaunchBtn').textContent = reconMission.status === 'complete' ? 'Mission Complete' : 'Resume Mission';
     renderMissionCockpit();
     saveReconMission();
   }
@@ -2475,10 +2476,13 @@ async function launchReconMission() {
   const radiusKm = +document.getElementById('missionRadius').value;
   const minElevation = currentRegion === 'japan' ? 250 : +document.getElementById('baseElevSlider').value;
   const cellKm = currentRegion === 'japan' ? 4 : 12;
-  // Resume uses the stopped mission's saved cells, candidates and review history.
+  // Resume uses the saved mission's cells, candidates and review history.
   // Its sampling mode must still match the selected region.
-  if (reconMission?.status === 'stopped' && reconMission.cellKm !== cellKm) {
-    log('Switch back to the saved mission region to resume; its results and reviews are retained.', 'warn');
+  if (reconMission && reconMission.status !== 'complete' && reconMission.cellKm !== cellKm) {
+    const savedRegion = reconMission.cellKm === 4 ? 'Japan' : reconMission.cellKm === 12 ? 'USA' : 'unknown';
+    const message = `Switch back to the saved mission region (${savedRegion}) to resume; its results and reviews are retained.`;
+    document.getElementById('missionStatus').textContent = message;
+    log(message, 'warn');
     return;
   }
   if (!reconMission || reconMission.status === 'complete' || reconMission.cellKm !== cellKm) {

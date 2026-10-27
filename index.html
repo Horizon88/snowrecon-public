@@ -2150,6 +2150,7 @@ let missionLayer = L.layerGroup().addTo(map);
 let missionParcelLayer = L.layerGroup().addTo(map);
 const missionParcelGeometry = new Map();
 const missionLandRequests = new WeakMap();
+let missionLandBatch = null;
 
 function escapeLandText(value) {
   return String(value == null ? '' : value).replace(/[&<>'"]/g, ch => ({
@@ -2346,21 +2347,37 @@ async function performMissionLandCheck(candidate, request, options) {
   return candidate.landCheck;
 }
 
-async function checkMissionLand() {
-  if (!reconMission?.candidates?.length) { log('Run a Recon Mission first; land checks attach to ranked terrain leads.', 'warn'); return; }
+function resetMissionLandBatch() {
+  missionLandBatch = null;
   const button = document.getElementById('missionLandBtn');
-  const queue = reconMission.candidates.filter(c => !(c.landCheck?.status === 'matched' && firstMissionParcel(c.landCheck))).slice(0, 30);
-  if (!queue.length) { drawMissionCandidates(); log('All ranked leads already have land checks.', 'ok'); return; }
-  button.disabled = true;
-  for (let i = 0; i < queue.length; i += 3) {
-    const batch = queue.slice(i, i + 3);
-    button.textContent = `Land ${Math.min(i + batch.length, queue.length)}/${queue.length}`;
-    await Promise.all(batch.map(c => checkMissionCandidateLand(c.id, { silent: true })));
-    renderMissionCockpit(); drawMissionCandidates();
-  }
   button.disabled = false; button.textContent = 'Check Land';
-  const matches = reconMission.candidates.filter(c => c.landCheck?.status === 'matched' && firstMissionParcel(c.landCheck)).length;
-  log(`Official parcel screening complete: ${matches} candidate centers matched to mapped parcels. Title, availability and legal access remain unverified.`, matches ? 'ok' : 'warn');
+}
+
+async function checkMissionLand() {
+  const mission = reconMission;
+  if (!mission?.candidates?.length) { log('Run a Recon Mission first; land checks attach to ranked terrain leads.', 'warn'); return; }
+  if (missionLandBatch?.mission === mission) return;
+  const button = document.getElementById('missionLandBtn');
+  const queue = mission.candidates.filter(c => !(c.landCheck?.status === 'matched' && firstMissionParcel(c.landCheck))).slice(0, 30);
+  if (!queue.length) { drawMissionCandidates(); log('All ranked leads already have land checks.', 'ok'); return; }
+  const operation = { mission };
+  missionLandBatch = operation;
+  const isCurrent = () => reconMission === mission && missionLandBatch === operation;
+  button.disabled = true;
+  try {
+    for (let i = 0; i < queue.length; i += 3) {
+      if (!isCurrent()) return;
+      const batch = queue.slice(i, i + 3).filter(c => mission.candidates.includes(c));
+      button.textContent = `Land ${Math.min(i + 3, queue.length)}/${queue.length}`;
+      await Promise.all(batch.map(c => checkMissionCandidateLand(c.id, { silent: true })));
+      if (!isCurrent()) return;
+      renderMissionCockpit(); drawMissionCandidates();
+    }
+    const matches = mission.candidates.filter(c => c.landCheck?.status === 'matched' && firstMissionParcel(c.landCheck)).length;
+    log(`Official parcel screening complete: ${matches} candidate centers matched to mapped parcels. Title, availability and legal access remain unverified.`, matches ? 'ok' : 'warn');
+  } finally {
+    if (missionLandBatch === operation) resetMissionLandBatch();
+  }
 }
 
 function escapeHtml(value) {
@@ -2418,6 +2435,7 @@ function saveReconMission() {
 }
 
 function loadReconMission() {
+  resetMissionLandBatch();
   try { reconMission = JSON.parse(localStorage.getItem(MISSION_KEY) || 'null'); }
   catch (_) { reconMission = null; }
   if (reconMission) {
@@ -2456,6 +2474,7 @@ async function launchReconMission() {
   const cellKm = currentRegion === 'japan' ? 4 : 12;
   if (!reconMission || reconMission.status === 'complete' || reconMission.status === 'stopped' || reconMission.cellKm !== cellKm) {
     const priorExclusions = reconMission?.exclusions || [];
+    resetMissionLandBatch();
     reconMission = {
       version: 1, id: `mission-${Date.now()}`, name: center.name || 'Recon mission',
       createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
@@ -2587,6 +2606,7 @@ function toggleMissionPause() {
 }
 
 function clearReconMission() {
+  resetMissionLandBatch();
   if (missionRunning) {
     missionStopRequested = true;
     reconMission.status = 'stopped';

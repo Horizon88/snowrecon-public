@@ -16,7 +16,7 @@ function setup(candidates,fetcher=()=>{throw Error('unexpected fetch');}) {
   const layer=()=>({clearLayers(){}});
   const shape=(type,args)=>{const record={type,args};shapes.push(record);return{
     bindPopup(popup){record.popup=popup;return this;},addTo(){return this;}};};
-  const context=vm.createContext({MISSION_KEY:'mission',reconMission:null,missionPaused:false,missionParcelGeometry:new Map(),missionLandRequests:new WeakMap(),
+  const context=vm.createContext({MISSION_KEY:'mission',reconMission:null,missionPaused:false,missionParcelGeometry:new Map(),missionLandRequests:new WeakMap(),missionLandBatch:null,
     document:{getElementById:id=>{if(!elements.has(id))elements.set(id,{style:{},innerHTML:'',textContent:''});return elements.get(id);}},
     localStorage:{getItem:key=>stored.get(key),setItem:(key,value)=>{stored.set(key,value);saves.push(JSON.parse(value));},removeItem:key=>stored.delete(key)},
     L:Object.fromEntries(['polygon','circle','circleMarker','geoJSON','rectangle'].map(type=>[type,(...args)=>shape(type,args)])),
@@ -189,7 +189,7 @@ function installWorker(s) {
 }
 const response=id=>({supported:true,status:'matched',checkedAt:'new',parcels:[{parcelId:id,ownershipClass:'private',acres:40}]});
 
-for(const workerFirst of [true,false]) test(`actual worker and bulk check share pending land work (${workerFirst?'worker first':'bulk first'})`,async()=>{
+for(const workerFirst of [true,false]) test(workerFirst?'bulk check joins the actual worker pending request':'bulk request remains the sole lookup when the worker retains a stronger existing lead',async()=>{
   let finish,started;
   const begun=new Promise(resolve=>started=resolve);
   const s=setup(workerFirst?[]:[lead('existing')],()=>{started();return new Promise(resolve=>finish=resolve);});
@@ -240,4 +240,50 @@ test('moved coordinates start fresh and an old completion cannot clear the newer
   const joined=s.context.checkMissionCandidateLand('move',{silent:true});assert.equal(s.requests.length,2);
   deferred[1](response('fresh'));assert.equal(await fresh,await joined);
   assert.equal(s.saved().candidates[0].landCheck.queryPosition.lat,45.002);
+});
+
+
+function installClear(s) {
+  Object.assign(s.context,{missionRunning:false,missionStopRequested:false});
+  vm.runInContext(html.slice(html.indexOf('function clearReconMission('),html.indexOf('function findMissionExclusion(')),s.context);
+}
+for(const fails of [false,true]) test(`bulk check stops after Clear despite late ${fails?'errors':'matches'}`,async()=>{
+  const deferred=[];const s=setup(Array.from({length:4},(_,i)=>lead('clear-'+i,{lat:45+i/100})),()=>new Promise((resolve,reject)=>deferred.push({resolve,reject})));
+  s.load();installClear(s);const outcome=s.context.checkMissionLand().then(()=>null,e=>e);
+  assert.equal(s.requests.length,3);s.context.clearReconMission();
+  assert.equal(s.elements.get('missionLandBtn').disabled,false);
+  for(const d of deferred)fails?d.reject(new Error('late')):d.resolve(response('old'));
+  assert.equal(await outcome,null);assert.equal(s.requests.length,3);assert.equal(s.context.reconMission,null);
+  assert.equal(s.stored.has('mission'),false);assert.ok(!s.logs.some(l=>l.message.includes('screening complete')));
+});
+
+test('old bulk completion cannot query reused IDs or reset controls owned by a replacement mission',async()=>{
+  const deferred=[];const s=setup(Array.from({length:4},(_,i)=>lead('same-'+i,{lat:45+i/100})),()=>new Promise(resolve=>deferred.push(resolve)));
+  s.load();const old=s.context.checkMissionLand().then(()=>null,e=>e);assert.equal(s.requests.length,3);
+  const replacement=s.saved();replacement.id='replacement';replacement.candidates=Array.from({length:4},(_,i)=>lead('same-'+i,{lat:46+i/100}));
+  s.stored.set('mission',JSON.stringify(replacement));s.load();
+  assert.equal(s.elements.get('missionLandBtn').disabled,false);
+  const fresh=s.context.checkMissionLand();assert.equal(s.requests.length,6);
+  deferred.slice(0,3).forEach(resolve=>resolve(response('old')));assert.equal(await old,null);
+  assert.equal(s.requests.length,6);assert.equal(s.elements.get('missionLandBtn').disabled,true);
+  assert.ok(!s.logs.some(l=>l.message.includes('screening complete')));
+  deferred.slice(3,6).forEach(resolve=>resolve(response('new')));
+  // Let the first batch settle and the queued fourth request begin.
+  for(let i=0;i<12&&s.requests.length<7;i++)await Promise.resolve();
+  assert.equal(s.requests.length,7);assert.equal(s.requests[6].lat,46.03);
+  deferred[6](response('fourth'));await fresh;
+  assert.equal(s.saved().id,'replacement');assert.equal(s.elements.get('missionLandBtn').disabled,false);
+  assert.equal(s.logs.filter(l=>l.message.includes('screening complete')).length,1);
+  assert.ok(s.saved().candidates.every(c=>!JSON.stringify(c).includes('"old"')));
+});
+
+test('Clear during an active mission cancels remaining bulk batches while retaining completed evidence',async()=>{
+  const deferred=[];const s=setup(Array.from({length:4},(_,i)=>lead('stop-'+i,{lat:45+i/100})),()=>new Promise(resolve=>deferred.push(resolve)));
+  s.load();installClear(s);s.context.missionRunning=true;
+  const bulk=s.context.checkMissionLand();const mission=s.context.reconMission;s.context.clearReconMission();
+  assert.equal(s.context.reconMission,mission);assert.equal(mission.status,'stopped');
+  deferred.forEach(resolve=>resolve(response('completed-before-stop')));await bulk;
+  assert.equal(s.requests.length,3);assert.equal(s.saved().candidates.filter(c=>c.landCheck?.status==='matched').length,3);
+  assert.equal(s.saved().candidates.find(c=>c.id==='stop-3').landCheck,undefined);
+  assert.ok(!s.logs.some(l=>l.message.includes('screening complete')));assert.equal(s.elements.get('missionLandBtn').disabled,false);
 });

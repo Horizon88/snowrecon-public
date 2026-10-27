@@ -16,7 +16,7 @@ function setup(candidates,fetcher=()=>{throw Error('unexpected fetch');}) {
   const layer=()=>({clearLayers(){}});
   const shape=(type,args)=>{const record={type,args};shapes.push(record);return{
     bindPopup(popup){record.popup=popup;return this;},addTo(){return this;}};};
-  const context=vm.createContext({MISSION_KEY:'mission',reconMission:null,missionPaused:false,missionParcelGeometry:new Map(),
+  const context=vm.createContext({MISSION_KEY:'mission',reconMission:null,missionPaused:false,missionParcelGeometry:new Map(),missionLandRequests:new WeakMap(),
     document:{getElementById:id=>{if(!elements.has(id))elements.set(id,{style:{},innerHTML:'',textContent:''});return elements.get(id);}},
     localStorage:{getItem:key=>stored.get(key),setItem:(key,value)=>{stored.set(key,value);saves.push(JSON.parse(value));},removeItem:key=>stored.delete(key)},
     L:Object.fromEntries(['polygon','circle','circleMarker','geoJSON','rectangle'].map(type=>[type,(...args)=>shape(type,args)])),
@@ -174,4 +174,70 @@ for(const oldFails of [false,true]) test(`explicit bulk retry after reload ignor
   assert.equal(saved.verdict,'reject');assert.equal(saved.rejectReason,'Manual rejection');
   assert.equal(s.elements.get('missionLandBtn').disabled,false);
   assert.match(s.logs.at(-1).message,/1 candidate centers matched to mapped parcels/);
+});
+
+function installWorker(s) {
+  const zone={maxVert:500,width:400,pointCount:6,maxElev:1000,minElev:500,centroidLat:45,centroidLng:-112,
+    aspectDir:'N',points:[{lat:45,lng:-112,elevation:1000},{lat:45.001,lng:-112,elevation:750},{lat:45.002,lng:-112,elevation:500}]};
+  Object.assign(s.context,{missionStopRequested:false,currentRegion:'usa',convexHull:points=>points,
+    RunEngine:{setZoneSensitivity(){},scanZones:async()=>zone.points,clusterZones:()=>[zone],fetchRoads:async()=>[]}});
+  s.context.reconMission.minElevation=0;
+  s.context.reconMission.cells=[{id:'cell',status:'pending',attempts:0,bounds:{south:44.9,north:45.1,west:-112.1,east:-111.9}}];
+  vm.runInContext(html.slice(html.indexOf('function missionHash('),html.indexOf('function saveReconMission('))
+    +html.slice(html.indexOf('async function runMissionWorker('),html.indexOf('function toggleMissionPause('))
+    +html.slice(html.indexOf('function findMissionExclusion('),html.indexOf('function rejectCurrentMapArea(')),s.context);
+}
+const response=id=>({supported:true,status:'matched',checkedAt:'new',parcels:[{parcelId:id,ownershipClass:'private',acres:40}]});
+
+for(const workerFirst of [true,false]) test(`actual worker and bulk check share pending land work (${workerFirst?'worker first':'bulk first'})`,async()=>{
+  let finish,started;
+  const begun=new Promise(resolve=>started=resolve);
+  const s=setup(workerFirst?[]:[lead('existing')],()=>{started();return new Promise(resolve=>finish=resolve);});
+  s.load();installWorker(s);
+  const first=workerFirst?s.context.runMissionWorker('worker'):s.context.checkMissionLand();
+  await begun;
+  const second=workerFirst?s.context.checkMissionLand():s.context.runMissionWorker('worker');
+  if(!workerFirst)await second;
+  assert.equal(s.requests.length,1);
+  finish(response('shared'));await Promise.all([first,second]);
+  assert.equal(s.requests.length,1);assert.equal(s.saved().candidates[0].landCheck.parcels[0].parcelId,'shared');
+  assert.equal(s.saved().candidates[0].landCheckHistory,undefined);
+  assert.ok(!s.stored.get('mission').includes('promise'));
+  assert.equal(s.context.missionLandRequests.get(s.context.reconMission.candidates[0]),undefined);
+});
+
+test('a visible caller joins a silent check and renders the shared result without duplicate history or saves',async()=>{
+  let finish;
+  const original=lead('join',{landCheck:validLand('old'),manualReview:{reason:'Keep'},manualReviewHistory:[{decision:{reason:'Keep'}}]});
+  const s=setup([original],()=>new Promise(resolve=>finish=resolve));s.load();
+  const first=s.context.checkMissionCandidateLand('join',{silent:true});
+  const joined=s.context.checkMissionCandidateLand('join');
+  assert.equal(s.requests.length,1);finish(response('visible-result'));
+  assert.equal(await first,await joined);assert.match(s.output(),/visible-result/);
+  assert.ok(s.shapes.length);assert.equal(s.saves.length,2);
+  const saved=s.saved().candidates[0];assert.equal(saved.landCheckHistory.length,1);
+  assert.deepEqual(saved.manualReview,original.manualReview);assert.deepEqual(saved.manualReviewHistory,original.manualReviewHistory);
+});
+
+test('network failure releases the flight for retry and completed checks can be explicitly rechecked',async()=>{
+  const deferred=[];const s=setup([lead('retry')],()=>new Promise((resolve,reject)=>deferred.push({resolve,reject})));s.load();
+  const first=s.context.checkMissionCandidateLand('retry',{silent:true}),joined=s.context.checkMissionCandidateLand('retry',{silent:true});
+  deferred[0].reject(new Error('temporary failure'));await Promise.all([first,joined]);
+  assert.equal(s.requests.length,1);assert.equal(s.saved().candidates[0].landCheck.status,'error');
+  const second=s.context.checkMissionCandidateLand('retry',{silent:true});assert.equal(s.requests.length,2);
+  deferred[1].resolve(response('repaired'));await second;
+  const third=s.context.checkMissionCandidateLand('retry',{silent:true});assert.equal(s.requests.length,3);
+  deferred[2].resolve(response('rechecked'));await third;
+  assert.deepEqual(s.saved().candidates[0].landCheckHistory.map(c=>c.status),['error','matched']);
+});
+
+test('moved coordinates start fresh and an old completion cannot clear the newer joinable flight',async()=>{
+  const deferred=[];const s=setup([lead('move')],()=>new Promise(resolve=>deferred.push(resolve)));s.load();
+  const old=s.context.checkMissionCandidateLand('move',{silent:true});
+  const c=s.context.reconMission.candidates[0];c.lat=45.002;
+  const fresh=s.context.checkMissionCandidateLand('move',{silent:true});
+  assert.equal(s.requests.length,2);deferred[0](response('old'));assert.equal(await old,null);
+  const joined=s.context.checkMissionCandidateLand('move',{silent:true});assert.equal(s.requests.length,2);
+  deferred[1](response('fresh'));assert.equal(await fresh,await joined);
+  assert.equal(s.saved().candidates[0].landCheck.queryPosition.lat,45.002);
 });

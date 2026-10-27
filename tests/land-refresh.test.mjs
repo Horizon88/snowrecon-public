@@ -7,7 +7,7 @@ const html = fs.readFileSync(new URL('../index.html', import.meta.url), 'utf8');
 function setup(candidate) {
   const requests = [], effects = {saved: 0, rendered: 0, drawn: 0};
   const mission = {candidates: [candidate]};
-  const context = vm.createContext({reconMission: mission, missionParcelGeometry: new Map(),
+  const context = vm.createContext({reconMission: mission, missionParcelGeometry: new Map(), missionLandRequests: new WeakMap(),
     fetchOfficialLandParcels: (lat, lng) => new Promise((resolve, reject) => requests.push({lat, lng, resolve, reject})),
     missionCandidateSort: () => 0, saveReconMission: () => effects.saved++,
     renderMissionCockpit: () => effects.rendered++, drawMissionCandidates: () => effects.drawn++});
@@ -51,8 +51,10 @@ test('an old-location response cannot replace a newer in-flight lookup', async (
   assert.equal(s.effects.saved, 1); assert.ok(s.context.missionParcelGeometry.has('lead'));
 });
 
-test('a superseded same-position request cannot erase a newer success with an error', async () => {
-  const c = lead(), s = setup(c), first = s.check('lead', {silent: true}), second = s.check('lead', {silent: true});
+test('an explicitly invalidated same-position request cannot erase a newer success with an error', async () => {
+  const c = lead(), s = setup(c), first = s.check('lead', {silent: true});
+  c.landCheck = {...c.landCheck}; // A different pending identity invalidates the original request.
+  const second = s.check('lead', {silent: true});
   s.requests[1].resolve(match('latest')); await second;
   s.requests[0].reject(new Error('late failure')); assert.equal(await first, null);
   assert.equal(c.landCheck.status, 'matched'); assert.equal(c.landCheck.parcels[0].parcelId, 'latest');
@@ -104,7 +106,9 @@ test('moving a rejected lead retains the decision without claiming the new point
 
 test('superseded checking markers are not archived as completed evidence', async () => {
   const c = lead(), s = setup(c);
-  const first = s.check('lead', {silent: true}), second = s.check('lead', {silent: true});
+  const first = s.check('lead', {silent: true});
+  c.landCheck = {...c.landCheck};
+  const second = s.check('lead', {silent: true});
   assert.equal(c.landCheckHistory, undefined);
   s.requests[0].resolve(match('old')); await first;
   s.requests[1].resolve(match('new')); await second;

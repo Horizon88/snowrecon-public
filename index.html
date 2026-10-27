@@ -2149,6 +2149,7 @@ let missionStopRequested = false;
 let missionLayer = L.layerGroup().addTo(map);
 let missionParcelLayer = L.layerGroup().addTo(map);
 const missionParcelGeometry = new Map();
+const missionLandRequests = new WeakMap();
 
 function escapeLandText(value) {
   return String(value == null ? '' : value).replace(/[&<>'"]/g, ch => ({
@@ -2267,11 +2268,31 @@ async function checkMissionCandidateLand(candidateId, options = {}) {
   const candidate = mission.candidates.find(c => c.id === candidateId);
   if (!candidate) return;
   const queryPosition = { lat: candidate.lat, lng: candidate.lng };
+  const active = missionLandRequests.get(candidate);
+  if (active?.mission === mission && active.pending === candidate.landCheck && active.promise
+      && active.queryPosition.lat === queryPosition.lat && active.queryPosition.lng === queryPosition.lng) {
+    const result = await active.promise;
+    if (!options.silent && result && reconMission === mission && mission.candidates.includes(candidate)
+        && candidate.lat === queryPosition.lat && candidate.lng === queryPosition.lng && candidate.landCheck === result) {
+      renderMissionCockpit(); drawMissionCandidates();
+    }
+    return result;
+  }
+  const request = { mission, queryPosition, pending: null, promise: null };
+  missionLandRequests.set(candidate, request);
+  request.promise = performMissionLandCheck(candidate, request, options);
+  try { return await request.promise; }
+  finally { if (missionLandRequests.get(candidate) === request) missionLandRequests.delete(candidate); }
+}
+
+async function performMissionLandCheck(candidate, request, options) {
+  const { mission, queryPosition } = request;
   if (candidate.landCheck && candidate.landCheck.status !== 'checking') {
     candidate.landCheckHistory ||= [];
     candidate.landCheckHistory.push(JSON.parse(JSON.stringify(candidate.landCheck)));
   }
   const pending = { status: 'checking', checkedAt: new Date().toISOString(), queryPosition };
+  request.pending = pending;
   candidate.landCheck = pending;
   missionParcelGeometry.delete(candidate.id);
   candidate.flags = (candidate.flags || []).filter(flag => flag !== 'public_land_requires_permission');

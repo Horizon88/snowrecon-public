@@ -85,3 +85,30 @@ test('an unchanged position retains its current match during evidence replacemen
   s.replace(c, {lat: 45, lng: -112, score: 60, flags: []});
   assert.equal(c.landCheck, original); assert.equal(c.terrainReviewHistory[0].landCheck.parcels[0].parcelId, 'same');
 });
+
+
+test('moving a rejected lead retains the decision without claiming the new point is excluded', () => {
+  const c = {...lead(), verdict: 'reject', rejectReason: 'area exclusion', flags: ['inside_rejected_area']};
+  const s = setup(c);
+  s.replace(c, {lat: 45.002, lng: -112.002, verdict: 'sideline', flags: []});
+  assert.equal(c.verdict, 'reject');
+  assert.ok(!c.flags.includes('inside_rejected_area'));
+  assert.ok(c.flags.includes('prior_area_rejection_retained'));
+  assert.ok(c.terrainReviewHistory[0].flags.includes('inside_rejected_area'));
+  s.replace(c, {lat: 45.003, lng: -112.003, verdict: 'sideline', flags: []});
+  assert.equal(c.verdict, 'reject');
+  assert.ok(c.flags.includes('prior_area_rejection_retained'));
+  s.replace(c, {lat: 45.004, lng: -112.004, verdict: 'reject', flags: ['inside_rejected_area']});
+  assert.ok(c.flags.includes('inside_rejected_area'));
+  assert.ok(!c.flags.includes('prior_area_rejection_retained'));
+});
+
+test('superseded checking markers are not archived as completed evidence', async () => {
+  const c = lead(), s = setup(c);
+  const first = s.check('lead', {silent: true}), second = s.check('lead', {silent: true});
+  assert.equal(c.landCheckHistory, undefined);
+  s.requests[0].resolve(match('old')); await first;
+  s.requests[1].resolve(match('new')); await second;
+  assert.equal(c.landCheckHistory, undefined);
+  assert.equal(c.landCheck.parcels[0].parcelId, 'new');
+});

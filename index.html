@@ -2562,8 +2562,7 @@ function rejectCurrentMapArea() {
   reconMission.exclusions ||= []; reconMission.exclusions.push(exclusion);
   reconMission.candidates.forEach(c => {
     if (c.lat < exclusion.bounds.south || c.lat > exclusion.bounds.north || c.lng < exclusion.bounds.west || c.lng > exclusion.bounds.east) return;
-    c.verdict='reject'; c.rejectReason=exclusion.reason; c.rejectedAt=exclusion.createdAt;
-    c.flags ||= []; if (!c.flags.includes('inside_rejected_area')) c.flags.unshift('inside_rejected_area');
+    recordMissionManualReview(c, 'reject', exclusion.reason, exclusion.createdAt, 'area', exclusion.id);
   });
   saveReconMission(); renderMissionCockpit(); drawMissionCandidates();
 }
@@ -2572,7 +2571,7 @@ function rejectMissionCandidate(event, id) {
   event.stopPropagation(); const c = reconMission?.candidates.find(x => x.id === id); if (!c) return;
   const reason = prompt('Why should this lead be rejected?', c.rejectReason || 'National forest / protected land');
   if (!reason || !reason.trim()) return;
-  c.verdict='reject'; c.rejectReason=reason.trim(); c.rejectedAt=new Date().toISOString();
+  recordMissionManualReview(c, 'reject', reason.trim(), new Date().toISOString());
   saveReconMission(); renderMissionCockpit(); drawMissionCandidates();
 }
 
@@ -2580,13 +2579,30 @@ function sidelineMissionCandidate(event, id) {
   event.stopPropagation(); const c = reconMission?.candidates.find(x => x.id === id); if (!c) return;
   const reason = prompt('Why should this lead be sidelined?', c.rejectReason || 'Needs further verification');
   if (!reason || !reason.trim()) return;
-  c.verdict='sideline'; c.rejectReason=reason.trim(); delete c.rejectedAt;
+  recordMissionManualReview(c, 'sideline', reason.trim(), new Date().toISOString());
   saveReconMission(); renderMissionCockpit(); drawMissionCandidates();
+}
+
+// Keep each decision's provenance detached from the mutable current candidate.
+function recordMissionManualReview(candidate, verdict, reason, at, source = 'candidate', exclusionId) {
+  const history = Array.isArray(candidate.manualReviewHistory) ? candidate.manualReviewHistory.slice() : [];
+  const prior = { verdict: candidate.verdict, reason: candidate.rejectReason, rejectedAt: candidate.rejectedAt,
+    position: { lat: candidate.lat, lng: candidate.lng }, flags: candidate.flags, manualReview: candidate.manualReview };
+  const decision = { verdict, reason, at, source, position: { lat: candidate.lat, lng: candidate.lng },
+    ...(exclusionId ? { exclusionId } : {}) };
+  history.push(JSON.parse(JSON.stringify({ before: prior, decision })));
+  candidate.manualReviewHistory = history;
+  candidate.manualReview = decision;
+  candidate.verdict = verdict; candidate.rejectReason = reason;
+  if (verdict === 'reject') candidate.rejectedAt = at; else delete candidate.rejectedAt;
+  candidate.flags = (candidate.flags || []).filter(flag => flag !== 'prior_area_rejection_retained');
+  if (source === 'area' && !candidate.flags.includes('inside_rejected_area')) candidate.flags.unshift('inside_rejected_area');
 }
 
 // A fresh scan must not inherit an older scan's completeness or erase a review.
 function replaceMissionCandidateEvidence(existing, candidate) {
   const history = Array.isArray(existing.terrainReviewHistory) ? existing.terrainReviewHistory.slice() : [];
+  const manualHistory = Array.isArray(existing.manualReviewHistory) ? existing.manualReviewHistory.slice() : null;
   const { terrainReviewHistory: priorHistory, ...priorRecord } = existing;
   history.push(JSON.parse(JSON.stringify(priorRecord)));
   const reviewed = existing.verdict === 'reject' || existing.rejectedAt
@@ -2599,6 +2615,7 @@ function replaceMissionCandidateEvidence(existing, candidate) {
   const terrainReviewStatus = ['complete', 'data_review'].includes(candidate.terrainReviewStatus)
     ? candidate.terrainReviewStatus : 'unknown';
   Object.assign(existing, candidate, { id: existing.id, terrainReviewStatus, terrainReviewHistory: history }, savedReview);
+  if (manualHistory) existing.manualReviewHistory = manualHistory;
   existing.flags = Array.isArray(existing.flags) ? [...existing.flags] : [];
   const positionChanged = existing.lat !== priorRecord.lat || existing.lng !== priorRecord.lng;
   if (positionChanged) {
@@ -2609,8 +2626,9 @@ function replaceMissionCandidateEvidence(existing, candidate) {
     if (!existing.flags.includes('parcel_status_unknown')) existing.flags.push('parcel_status_unknown');
   }
   if (savedReview.verdict === 'reject' && !existing.flags.includes('inside_rejected_area')) {
-    const priorAreaRejection = priorRecord.flags?.includes('inside_rejected_area');
-    const retainedAreaRejection = priorRecord.flags?.includes('prior_area_rejection_retained');
+    const currentManualDecision = priorRecord.manualReview?.source === 'candidate';
+    const priorAreaRejection = !currentManualDecision && priorRecord.flags?.includes('inside_rejected_area');
+    const retainedAreaRejection = !currentManualDecision && priorRecord.flags?.includes('prior_area_rejection_retained');
     const flag = priorAreaRejection && !positionChanged ? 'inside_rejected_area'
       : priorAreaRejection || retainedAreaRejection ? 'prior_area_rejection_retained' : null;
     if (flag && !existing.flags.includes(flag)) existing.flags.unshift(flag);

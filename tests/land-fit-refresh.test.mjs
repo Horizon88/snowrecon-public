@@ -5,11 +5,10 @@ import vm from 'node:vm';
 const html = fs.readFileSync(new URL('../index.html', import.meta.url), 'utf8');
 const elements = new Map();
 const context = vm.createContext({missionParcelGeometry: new Map(), missionPaused: false,
-  document: {getElementById: id => {if (!elements.has(id)) elements.set(id, {style: {}, innerHTML: ''}); return elements.get(id);}},
-  escapeHtml: text => String(text).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;')});
+  document: {getElementById: id => {if (!elements.has(id)) elements.set(id, {style: {}, innerHTML: ''}); return elements.get(id);}}});
 const start = html.indexOf('function replaceMissionCandidateEvidence(');
 const end = html.indexOf('\nfunction drawMissionCandidates()', start);
-vm.runInContext(html.slice(html.indexOf('function escapeLandText('), html.indexOf('function publicNullableNumber(')) + html.slice(start, end), context);
+vm.runInContext(html.slice(html.indexOf('function escapeHtml('), html.indexOf('function applyMissionPreset(')) + html.slice(html.indexOf('function escapeLandText('), html.indexOf('function publicNullableNumber(')) + html.slice(start, end), context);
 const replace = context.replaceMissionCandidateEvidence;
 const lead = () => ({id:'same', lat:45, lng:-112, verdict:'sideline', score:80, verticalM:400,
   flags:[], catAccess:{grade:'A', distanceKm:1, maxSlopeDeg:12},

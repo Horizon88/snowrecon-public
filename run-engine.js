@@ -1052,13 +1052,36 @@ out body geom;`;
     const total = gridSize * gridSize;
     const coverage = { scope: 'sampled_grid_and_traces', totalSamples: total,
       measuredSamples: 0, missingElevationSamples: 0, missingSlopeSamples: 0,
-      incompleteTraces: 0, limitedTraces: 0, complete: false };
+      incompleteTraces: 0, limitedTraces: 0, unrequestedSamples: 0,
+      unrequestedSlopeSamples: 0, unrequestedTraces: 0, complete: false };
+    const requested = new Set(), incompleteTiles = new Set(), deferredTiles = new Set();
+    const tileKeyAt = (lat,lng) => { const t=latLngToTile(lat,lng,14); return `14/${t.tileX}/${t.tileY}`; };
+    const maxNewTiles = 512; // Per scan, including on-demand trace stencils.
+    async function ensureTiles(keys) {
+      const pending = [...new Set(keys)].filter(key => parsedCache[key] === undefined);
+      for (let i=0;i<pending.length;i+=4) await Promise.all(pending.slice(i,i+4).map(async key => {
+        if (!requested.has(key) && requested.size >= maxNewTiles) { deferredTiles.add(key); return; }
+        requested.add(key); const [z,x,y]=key.split('/').map(Number); await fetchAndParseTile(z,x,y);
+      }));
+    }
+    function missingAt(points) {
+      let unrequested=false, missing=false;
+      for(const [lat,lng] of points) if(!Number.isFinite(getElevationFast(lat,lng))) {
+        const key=tileKeyAt(lat,lng);
+        if(parsedCache[key] === undefined) { unrequested=true; deferredTiles.add(key); }
+        else { missing=true; incompleteTiles.add(key); }
+      }
+      return { unrequested, missing };
+    }
+    // Use actual Web Mercator tile extents, not a longitude approximation.
+    const nw=latLngToTile(bounds.north,bounds.west,14), se=latLngToTile(bounds.south,bounds.east,14);
+    const initialTiles=[];
+    for(let y=Math.max(0,nw.tileY-1);y<=Math.min(16383,se.tileY+1);y++)
+      for(let x=Math.max(0,nw.tileX-1);x<=Math.min(16383,se.tileX+1);x++) initialTiles.push(`14/${x}/${y}`);
+    await ensureTiles(initialTiles);
 
     for (let i = 0; i < gridSize; i++) {
       const rowLat = bounds.south + latStep * (i + 0.5);
-      // Prefetch tiles for this row
-      await prefetchTiles(rowLat, (bounds.east + bounds.west) / 2,
-        Math.max(2, Math.ceil((bounds.east - bounds.west) / 0.044 / 2)));
       await yieldToUI();
 
       for (let j = 0; j < gridSize; j++) {
@@ -1069,11 +1092,20 @@ out body geom;`;
         if (onProgress && processed % 10 === 0) onProgress(processed, total, 'Scanning terrain');
 
         const elev = getElevationFast(lat, lng);
-        if (!Number.isFinite(elev)) { coverage.missingElevationSamples++; continue; }
+        if (!Number.isFinite(elev)) {
+          const gap=missingAt([[lat,lng]]);
+          if(gap.unrequested) coverage.unrequestedSamples++; else coverage.missingElevationSamples++;
+          continue;
+        }
         if (elev < (options.minElevation ?? 300)) { coverage.measuredSamples++; continue; }
 
         const analysis = analyzeFast(lat, lng, 0.0005);
-        if (!analysis || !Number.isFinite(analysis.slope)) { coverage.missingSlopeSamples++; continue; }
+        if (!analysis || !Number.isFinite(analysis.slope)) {
+          const gap=missingAt([[lat,lng],[lat+.0005,lng],[lat-.0005,lng],[lat,lng+.0005],[lat,lng-.0005]]);
+          if(gap.unrequested) coverage.unrequestedSlopeSamples++;
+          if(gap.missing) coverage.missingSlopeSamples++;
+          continue;
+        }
         coverage.measuredSamples++;
         if (analysis.slope < slopeThreshold) continue;
 
@@ -1093,8 +1125,13 @@ out body geom;`;
           const offsets = [[0,0],[1,0],[-1,0],[0,1],[0,-1],
             [Math.SQRT1_2,Math.SQRT1_2],[Math.SQRT1_2,-Math.SQRT1_2],
             [-Math.SQRT1_2,Math.SQRT1_2],[-Math.SQRT1_2,-Math.SQRT1_2]];
-          if (!offsets.every(([dy,dx]) => Number.isFinite(getElevationFast(curLat + dy*stepDelta, curLng + dx*stepDelta)))) {
-            coverage.incompleteTraces++; traceFinished = true; break;
+          const stencil=offsets.map(([dy,dx])=>[curLat+dy*stepDelta,curLng+dx*stepDelta]);
+          await ensureTiles(stencil.map(([lat,lng])=>tileKeyAt(lat,lng)));
+          const gap=missingAt(stencil);
+          if (gap.unrequested || gap.missing) {
+            if(gap.unrequested) coverage.unrequestedTraces++;
+            if(gap.missing) coverage.incompleteTraces++;
+            traceFinished = true; break;
           }
           const sg = smoothGradient(curLat, curLng, stepDelta);
           if (!sg) { traceFinished = true; break; }
@@ -1134,8 +1171,26 @@ out body geom;`;
     }
 
     coverage.complete = coverage.missingElevationSamples === 0 && coverage.missingSlopeSamples === 0
-      && coverage.incompleteTraces === 0 && coverage.limitedTraces === 0;
+      && coverage.incompleteTraces === 0 && coverage.limitedTraces === 0
+      && coverage.unrequestedSamples === 0 && coverage.unrequestedSlopeSamples === 0 && coverage.unrequestedTraces === 0;
+    coverage.incompleteTileKeys=[...incompleteTiles].sort();
+    coverage.unrequestedTileKeys=[...deferredTiles].sort();
+    coverage.newTilesRequested=requested.size;
     return { samples: results, coverage };
+  }
+
+  // Explicit user retry only: invalidate recorded failures, never valid tiles or
+  // the whole cache. A page reload naturally starts with an empty cache.
+  function retryIncompleteDEMTiles(keys) {
+    let cleared=0;
+    for(const key of new Set(keys || [])) {
+      if(typeof key !== 'string' || !/^14\/\d+\/\d+$/.test(key)) continue;
+      const cached=parsedCache[key];
+      if(cached === null || (cached instanceof Float32Array && cached.some(v=>!Number.isFinite(v)))) {
+        delete parsedCache[key]; cleared++;
+      }
+    }
+    return cleared;
   }
 
   // Retention and preference are separate. Width remains the existing screen;
@@ -1400,6 +1455,7 @@ out body geom;`;
     setZoneSensitivity,
     getZoneSensitivity,
     scanZones,
+    retryIncompleteDEMTiles,
     screenMissionZones,
     clusterZones,
     scoreZone,

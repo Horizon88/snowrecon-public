@@ -16,7 +16,9 @@ North American Recon Mission candidates can be matched to official parcel data w
 
 ## Terrain screen and local tests
 
-Recon missions retain sampled zones from 150 m modeled descent; 250 m is preferred. The existing 200 m cluster-span screen remains a search heuristic, not measured usable ski width. Missing DEM pixels, incomplete slope/trace stencils, and traces reaching the analysis limit retain a cell as `data_review`, even when no qualifying zone was found. A complete sampled screen can still fail the numerical criteria; it does not establish whole-parcel coverage or operational suitability. Existing saved rejections are not automatically rewritten.
+Recon missions retain sampled zones from 150 m modeled descent; 250 m is preferred. The existing 200 m cluster-span screen remains a search heuristic, not measured usable ski width. Missing DEM pixels, incomplete slope/trace stencils, and traces reaching the analysis limit retain a cell as `data_review`, even when no qualifying zone was found. A complete sampled screen can still fail the numerical criteria; it does not establish whole-parcel coverage or operational suitability. Existing saved rejections are not automatically rewritten. Tile preparation uses the actual z14 bounds plus a margin, and descent stencils request additional tiles as needed, with at most 512 new tile requests per scan. Budget-deferred samples are recorded separately from failed/missing DEM.
+
+A completed mission with unresolved cells offers **Retry data review**. This explicit action preserves its ID, candidates, exclusions and a snapshot of the prior evidence. It refreshes only recorded failed/incomplete tiles, runs one bounded pass, and preserves user rejection/sidelining decisions; mapped exclusions still take precedence. There is no automatic retry loop.
 
 Run the dependency-free regression suite with Node.js 22 or newer:
 

@@ -383,7 +383,7 @@
   </div>
 </div>
 
-<script src="run-engine.js?v=20261027a"></script>
+<script src="run-engine.js?v=20261027b"></script>
 <script>
 // ===== DEBUG =====
 function log(msg, cls='') {
@@ -2377,8 +2377,28 @@ function loadReconMission() {
   }
 }
 
+async function retryMissionDataReview() {
+  if (missionRunning || !reconMission) return;
+  const cells=reconMission.cells.filter(c=>c.status==='data_review');
+  if (!cells.length) return;
+  if (reconMission.cellKm !== (currentRegion === 'japan' ? 4 : 12)) {
+    alert('Switch to this mission’s original region before retrying its data review.'); return;
+  }
+  // Preserve the exact prior evidence before explicit remeasurement.
+  reconMission.retryHistory ||= [];
+  reconMission.retryHistory.push(JSON.parse(JSON.stringify({ at:new Date().toISOString(),
+    cells, candidates:reconMission.candidates, reason:'explicit_data_review_retry' })));
+  RunEngine.retryIncompleteDEMTiles(cells.flatMap(c=>c.coverage?.incompleteTileKeys || []));
+  cells.forEach(c=>{ c.status='pending'; c.agent=null; });
+  reconMission.status='paused';
+  await launchReconMission();
+}
+
 async function launchReconMission() {
   if (missionRunning) return;
+  if (reconMission && ['complete','stopped'].includes(reconMission.status) && reconMission.cells.some(c=>c.status==='data_review')) {
+    return retryMissionDataReview();
+  }
   const presetKey = document.getElementById('missionPreset').value;
   const preset = presetKey === 'current' ? null : MISSION_PRESETS[presetKey];
   const center = preset || { lat: map.getCenter().lat, lng: map.getCenter().lng, name: 'Current map area' };
@@ -2496,7 +2516,11 @@ async function runMissionWorker(agentName) {
           reconMission.candidates.push(candidate);
           if (candidate.lat >= 44.35 && candidate.lat <= 49.01 && candidate.lng >= -116.1 && candidate.lng <= -104.0) autoLandChecks.push(candidate.id);
         } else if (candidate.score > dupe.score || (candidate.catAccess && !dupe.catAccess)) {
-          Object.assign(dupe, candidate, { id: dupe.id });
+          const reviewed = dupe.verdict === 'reject' || dupe.rejectedAt || dupe.manualReview
+            || (dupe.verdict === 'sideline' && dupe.rejectReason);
+          const savedReview = reviewed && candidate.verdict !== 'reject' ? { verdict:dupe.verdict, rejectReason:dupe.rejectReason,
+            rejectedAt:dupe.rejectedAt, manualReview:dupe.manualReview } : (dupe.manualReview ? {manualReview:dupe.manualReview} : {});
+          Object.assign(dupe, candidate, { id: dupe.id }, savedReview);
           if (!dupe.landCheck && dupe.lat >= 44.35 && dupe.lat <= 49.01 && dupe.lng >= -116.1 && dupe.lng <= -104.0) autoLandChecks.push(dupe.id);
         }
       }
@@ -2564,6 +2588,7 @@ function rejectMissionCandidate(event, id) {
   const reason = prompt('Why should this lead be rejected?', c.rejectReason || 'National forest / protected land');
   if (!reason || !reason.trim()) return;
   c.verdict='reject'; c.rejectReason=reason.trim(); c.rejectedAt=new Date().toISOString();
+  c.manualReview={verdict:'reject',reason:reason.trim(),at:c.rejectedAt};
   saveReconMission(); renderMissionCockpit(); drawMissionCandidates();
 }
 
@@ -2572,6 +2597,7 @@ function sidelineMissionCandidate(event, id) {
   const reason = prompt('Why should this lead be sidelined?', c.rejectReason || 'Needs further verification');
   if (!reason || !reason.trim()) return;
   c.verdict='sideline'; c.rejectReason=reason.trim(); delete c.rejectedAt;
+  c.manualReview={verdict:'sideline',reason:reason.trim(),at:new Date().toISOString()};
   saveReconMission(); renderMissionCockpit(); drawMissionCandidates();
 }
 
@@ -2588,10 +2614,12 @@ function renderMissionCockpit() {
   document.getElementById('missionErrors').textContent = reconMission.errors;
   const active = reconMission.cells.filter(c => c.status === 'running').map(c => `${c.agent}: ${c.id}`).join(' · ');
   const dataReview = reconMission.cells.filter(c => c.status === 'data_review').length;
+  if (!missionRunning) document.getElementById('missionLaunchBtn').textContent = dataReview && ['complete','stopped'].includes(reconMission.status)
+    ? 'Retry data review' : reconMission.status === 'complete' ? 'Mission Complete' : 'Resume Mission';
   const purchaseLeads = reconMission.candidates.filter(c => c.landCheck?.landPath === 'purchase_lead').length;
   document.getElementById('missionStatus').textContent = reconMission.status === 'complete'
     ? `Complete · ${reconMission.name} · ${reconMission.candidates.length} terrain leads · ${purchaseLeads} private purchase leads · ${dataReview} cells need data review`
-    : missionPaused ? 'Paused · progress saved locally' : active || 'Workers preparing next cells…';
+    : missionPaused ? 'Paused · progress saved locally' : (active || 'Workers preparing next cells…') + (dataReview ? ` · ${dataReview} cells need data review` : '');
   const reports = document.getElementById('missionReports');
   reports.innerHTML = reconMission.candidates.slice(0, 30).map((c, i) => {
     const land = c.landCheck, parcel = land?.parcels?.[0];
@@ -2606,7 +2634,7 @@ function renderMissionCockpit() {
     return `<div class="mission-card" onclick="map.flyTo([${c.lat},${c.lng}],13)">
       <div style="display:flex;align-items:center;gap:5px"><b style="font-size:10px;color:#fff">#${i+1} ${c.lat.toFixed(4)}, ${c.lng.toFixed(4)}</b><span style="flex:1"></span><span class="mission-badge" style="color:${c.verdict==='advance'?'var(--green)':c.verdict==='reject'?'var(--red)':'var(--orange)'}">${c.verdict}</span>${score}</div>
       <div class="run-metrics"><span class="run-metric" style="color:var(--green)">${c.verticalM}m vert${c.preferredVertical ? " · preferred" : ""}</span><span class="run-metric" style="color:var(--cyan)">${c.clusterSpanM}m cluster span*</span><span class="run-metric" style="color:var(--accent)">${c.aspect}</span><span class="run-metric" style="color:var(--orange)">${c.catAccess ? 'Access '+(c.catAccess.grade||'?')+' · '+c.catAccess.distanceKm+'km / '+c.catAccess.maxSlopeDeg+'°' : 'Access U · unverified'}</span></div>
-      ${legal}${c.rejectReason ? `<div style="font-size:8px;color:${c.verdict==='reject'?'var(--red)':'var(--orange)'};margin-top:4px">${escapeHtml(c.rejectReason)}</div>` : ''}<div style="display:flex;align-items:center;gap:4px;margin-top:5px"><span style="font-size:8px;color:var(--dim);flex:1">Confidence ${Math.round(c.confidence*100)}% · ${c.agent} · ${c.flags.length} open checks</span><button class="btn" onclick="event.stopPropagation();checkMissionCandidateLand('${c.id}')" style="font-size:8px;color:var(--cyan)">${land ? 'Recheck land' : 'Check land'}</button><button class="btn" onclick="sidelineMissionCandidate(event,'${c.id}')" style="font-size:8px;color:var(--orange)">Sideline</button><button class="btn" onclick="rejectMissionCandidate(event,'${c.id}')" style="font-size:8px;color:var(--red)">Reject</button></div></div>`;
+      ${legal}${c.terrainReviewStatus === 'data_review' ? '<div style="font-size:8px;color:var(--orange);margin-top:4px">Terrain evidence incomplete · retained for data review</div>' : ''}${c.rejectReason ? `<div style="font-size:8px;color:${c.verdict==='reject'?'var(--red)':'var(--orange)'};margin-top:4px">${escapeHtml(c.rejectReason)}</div>` : ''}<div style="display:flex;align-items:center;gap:4px;margin-top:5px"><span style="font-size:8px;color:var(--dim);flex:1">Confidence ${Math.round(c.confidence*100)}% · ${c.agent} · ${c.flags.length} open checks</span><button class="btn" onclick="event.stopPropagation();checkMissionCandidateLand('${c.id}')" style="font-size:8px;color:var(--cyan)">${land ? 'Recheck land' : 'Check land'}</button><button class="btn" onclick="sidelineMissionCandidate(event,'${c.id}')" style="font-size:8px;color:var(--orange)">Sideline</button><button class="btn" onclick="rejectMissionCandidate(event,'${c.id}')" style="font-size:8px;color:var(--red)">Reject</button></div></div>`;
   }).join('') || '<div style="font-size:9px;color:var(--dim);padding:6px">No leads yet. Workers report here as cells finish.</div>';
 }
 

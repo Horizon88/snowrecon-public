@@ -241,6 +241,9 @@
       <button class="btn" onclick="rejectCurrentMapArea()" style="color:var(--red);border-color:rgba(239,68,68,.45)" title="Reject everything inside the current map view and remember why">Reject View</button>
       <button class="btn" onclick="clearReconMission()">Clear</button>
     </div>
+    <div style="margin-bottom:6px">
+      <button class="btn" onclick="exportMissionHistory()" title="Download current and archived mission evidence and review history">Export History</button>
+    </div>
     <div style="font-size:8px;color:var(--dim);margin:-2px 0 6px">Japan uses smaller 4 km search cells. Zoom around Yotei and choose <b style="color:var(--red)">Reject View</b> to exclude that area permanently.</div>
     <div id="missionPanel" style="display:none;margin-bottom:8px">
       <div class="mission-progress"><div id="missionProgressBar"></div></div>
@@ -2437,6 +2440,64 @@ function saveReconMission() {
   localStorage.setItem(MISSION_KEY, JSON.stringify(reconMission));
 }
 
+function readMissionHistory() {
+  const prefix = MISSION_KEY + ':history:';
+  const archived = [], unreadable = [];
+  const keys = Array.from({ length: localStorage.length }, (_, i) => localStorage.key(i))
+    .filter(key => key && key.startsWith(prefix)).sort();
+  for (const key of keys) {
+    const raw = localStorage.getItem(key);
+    if (raw == null) continue;
+    try {
+      const entry = JSON.parse(raw);
+      if (entry?.version !== 1 || !entry.mission || typeof entry.mission !== 'object'
+          || typeof entry.reason !== 'string' || typeof entry.archivedAt !== 'string') throw new Error('Unknown history format');
+      archived.push({ key, ...entry });
+    } catch (_) { unreadable.push({ key, raw }); }
+  }
+  return { archived, unreadable };
+}
+
+function showMissionHistoryError() {
+  const message = 'Could not save mission history; existing results are retained. Export history or free storage, then retry.';
+  document.getElementById('missionPanel').style.display = 'block';
+  document.getElementById('missionStatus').textContent = message;
+  log(message, 'warn');
+}
+
+function archiveReconMission(reason) {
+  if (!reconMission) return true;
+  try {
+    const snapshot = JSON.stringify(reconMission);
+    // Separate immutable storage keys avoid rewriting an older archive or a
+    // shared index when another tab archives its own mission.
+    if (readMissionHistory().archived.some(entry => JSON.stringify(entry.mission) === snapshot)) return true;
+    const suffix = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const key = MISSION_KEY + ':history:' + suffix;
+    if (localStorage.getItem(key) != null) throw new Error('History key collision');
+    const raw = JSON.stringify({ version: 1, archivedAt: new Date().toISOString(), reason, mission: JSON.parse(snapshot) });
+    localStorage.setItem(key, raw);
+    if (localStorage.getItem(key) !== raw) throw new Error('History write was not retained');
+    return true;
+  } catch (_) { showMissionHistoryError(); return false; }
+}
+
+function missionHistoryExport() {
+  return { version: 1, exportedAt: new Date().toISOString(), ...readMissionHistory(),
+    active: reconMission ? JSON.parse(JSON.stringify(reconMission)) : null };
+}
+
+function exportMissionHistory() {
+  try {
+    const blob = new Blob([JSON.stringify(missionHistoryExport(), null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a'); a.href = url; a.download = 'snowrecon-mission-history.json'; a.click();
+    URL.revokeObjectURL(url);
+  } catch (_) {
+    log('Mission history could not be exported; saved records are unchanged.', 'warn');
+  }
+}
+
 function loadReconMission() {
   resetMissionLandBatch();
   try { reconMission = JSON.parse(localStorage.getItem(MISSION_KEY) || 'null'); }
@@ -2486,6 +2547,7 @@ async function launchReconMission() {
     return;
   }
   if (!reconMission || reconMission.status === 'complete' || reconMission.cellKm !== cellKm) {
+    if (reconMission && !archiveReconMission('completed_replacement')) return;
     const priorExclusions = reconMission?.exclusions || [];
     resetMissionLandBatch();
     reconMission = {
@@ -2628,9 +2690,12 @@ function clearReconMission() {
     saveReconMission();
     return;
   }
+  if (!archiveReconMission('clear')) return;
+  try { localStorage.removeItem(MISSION_KEY); }
+  catch (_) { showMissionHistoryError(); return; }
   resetMissionLandBatch();
   missionStopRequested = true; missionRunning = false; missionPaused = false;
-  reconMission = null; localStorage.removeItem(MISSION_KEY);
+  reconMission = null;
   missionLayer.clearLayers();
   missionParcelLayer.clearLayers(); missionParcelGeometry.clear();
   document.getElementById('missionPanel').style.display = 'none';

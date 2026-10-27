@@ -17,3 +17,9 @@ North American Recon Mission candidates can be matched to official parcel data w
 ## Evidence labels
 
 Recon mission cards describe the stored qualifying sample count, terrain completeness and modeled cat-route status. A modeled route does not establish legal access. Fixed confidence percentages are no longer generated or displayed; legacy confidence fields remain untouched in saved mission data in browser storage. Missing completeness information on older records is shown as unknown.
+
+## Saved mission history
+
+Clear saves a complete snapshot before removing an idle mission. Starting another mission after completion also preserves the previous mission, including candidates, parcel evidence, exclusions and manual review history. Each snapshot stays separate in this browser’s local storage; existing snapshots are never replaced. If history cannot be saved, Clear or replacement stops and the current mission is retained.
+
+Use **Export History** to download the current mission and archived snapshots, including any unreadable stored history as its original text. This is local browser storage, not a cloud backup. Clearing browser data removes it. Clear during active work still stops workers first and retains the mission for resume.

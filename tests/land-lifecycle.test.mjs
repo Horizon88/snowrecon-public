@@ -18,7 +18,7 @@ function setup(candidates,fetcher=()=>{throw Error('unexpected fetch');}) {
     bindPopup(popup){record.popup=popup;return this;},addTo(){return this;}};};
   const context=vm.createContext({MISSION_KEY:'mission',reconMission:null,missionPaused:false,missionRunning:false,missionParcelGeometry:new Map(),missionLandRequests:new WeakMap(),missionLandBatch:null,
     document:{getElementById:id=>{if(!elements.has(id))elements.set(id,{style:{},innerHTML:'',textContent:''});return elements.get(id);}},
-    localStorage:{getItem:key=>stored.get(key),setItem:(key,value)=>{stored.set(key,value);saves.push(JSON.parse(value));},removeItem:key=>stored.delete(key)},
+    localStorage:{get length(){return stored.size;},key:i=>[...stored.keys()][i]??null,getItem:key=>stored.get(key),setItem:(key,value)=>{stored.set(key,value);saves.push(JSON.parse(value));},removeItem:key=>stored.delete(key)},
     L:Object.fromEntries(['polygon','circle','circleMarker','geoJSON','rectangle'].map(type=>[type,(...args)=>shape(type,args)])),
     missionLayer:layer(),missionParcelLayer:layer(),log:(message,level)=>logs.push({message,level}),
     fetchOfficialLandParcels:async(lat,lng)=>{requests.push({lat,lng});return fetcher(lat,lng);}});
@@ -430,4 +430,54 @@ test('reload labels stopped and paused saved missions as resumable',()=>{
     s.context.saveReconMission();s.context.document.getElementById('missionLaunchBtn').textContent='Launch Recon Mission';s.load();
     assert.equal(s.elements.get('missionLaunchBtn').textContent,'Resume Mission');
   }
+});
+
+const historyKey='mission:history:';
+function archived(s){return [...s.stored].filter(([key])=>key.startsWith(historyKey)).map(([key,raw])=>({key,...JSON.parse(raw)}));}
+
+test('idle Clear archives the complete mission snapshot and retains it after reload and later mutation',()=>{
+  const c=lead('kept',{landCheck:validLand('source'),landCheckHistory:[validLand('older')],manualReviewHistory:[{decision:{verdict:'reject',reason:'Keep history'}}],terrainReviewHistory:[{score:40}]});
+  const s=setup([c]);s.load();installClear(s);const old=s.context.reconMission,before=clone(old);
+  s.context.clearReconMission();assert.equal(s.context.reconMission,null);assert.equal(s.stored.has('mission'),false);
+  assert.equal(archived(s).length,1);assert.deepEqual(archived(s)[0].mission,before);assert.equal(archived(s)[0].reason,'clear');
+  old.candidates[0].manualReviewHistory[0].decision.reason='later mutation';s.load();
+  assert.deepEqual(archived(s)[0].mission,before);assert.deepEqual(clone(s.context.missionHistoryExport().archived[0].mission),before);
+});
+
+test('completed launch archives all evidence before replacement without rewriting older snapshots',async()=>{
+  const s=setup([lead('first',{manualReview:{verdict:'approve'},manualReviewHistory:[{decision:{verdict:'approve'}}]})]);s.load();
+  const old=clone(s.context.reconMission),finish=installLaunch(s),launch=s.context.launchReconMission();
+  assert.equal(archived(s).length,1);assert.deepEqual(archived(s)[0].mission,old);assert.equal(archived(s)[0].reason,'completed_replacement');
+  const key=archived(s)[0].key,bytes=s.stored.get(key);finish();await launch;
+  s.context.reconMission.candidates.push(lead('second',{manualReviewHistory:[{decision:{verdict:'reject'}}]}));installClear(s);s.context.clearReconMission();
+  assert.equal(archived(s).length,2);assert.equal(s.stored.get(key),bytes);assert.equal(s.context.missionHistoryExport().archived.length,2);
+});
+
+for(const action of ['clear','launch'])test(`archive quota failure blocks ${action} before mission or request ownership changes`,async()=>{
+  const s=setup([lead('preserved')]);s.load();installClear(s);installLaunch(s);const old=s.context.reconMission,before=s.stored.get('mission');
+  const owner={mission:old};s.context.missionLandBatch=owner;let workers=0;s.context.runMissionWorker=async()=>workers++;
+  const set=s.context.localStorage.setItem;s.context.localStorage.setItem=(key,value)=>{if(key.startsWith(historyKey))throw Error('quota');set(key,value);};
+  if(action==='clear')s.context.clearReconMission();else await s.context.launchReconMission();
+  assert.equal(s.context.reconMission,old);assert.equal(s.stored.get('mission'),before);assert.equal(s.context.missionLandBatch,owner);assert.equal(workers,0);assert.equal(archived(s).length,0);
+  assert.match(s.elements.get('missionStatus').textContent,/history.*retained/i);
+});
+
+test('failed active-key removal retains mission and retry reuses identical snapshot',()=>{
+  const s=setup([lead('preserved')]);s.load();installClear(s);const old=s.context.reconMission,before=s.stored.get('mission'),remove=s.context.localStorage.removeItem;
+  s.context.localStorage.removeItem=()=>{throw Error('denied');};s.context.clearReconMission();
+  assert.equal(s.context.reconMission,old);assert.equal(s.stored.get('mission'),before);assert.equal(archived(s).length,1);
+  s.context.localStorage.removeItem=remove;s.context.clearReconMission();assert.equal(s.context.reconMission,null);assert.equal(archived(s).length,1);
+});
+
+test('history export preserves malformed archive bytes and includes a detached active snapshot',()=>{
+  const s=setup([lead('active',{manualReviewHistory:[{decision:{reason:'Keep'}}]})]);s.load();s.stored.set(historyKey+'damaged','{broken');
+  const data=clone(s.context.missionHistoryExport());assert.deepEqual(data.unreadable,[{key:historyKey+'damaged',raw:'{broken'}]);assert.deepEqual(data.active,s.saved());
+  s.context.reconMission.candidates[0].id='changed';assert.equal(data.active.candidates[0].id,'active');assert.equal(s.stored.get(historyKey+'damaged'),'{broken');
+});
+
+test('late parcel result cannot mutate an archived Clear snapshot or launch queued work',async()=>{
+  const deferred=[];const s=setup(Array.from({length:4},(_,i)=>lead('archived-'+i)),()=>new Promise(resolve=>deferred.push(resolve)));
+  s.load();installClear(s);const pending=s.context.checkMissionLand();s.context.clearReconMission();const record=archived(s)[0];assert.ok(record);const bytes=s.stored.get(record.key);
+  deferred.forEach(resolve=>resolve(response('late')));await pending;
+  assert.equal(s.requests.length,3);assert.equal(s.stored.get(record.key),bytes);assert.equal(s.context.reconMission,null);assert.equal(s.stored.has('mission'),false);
 });

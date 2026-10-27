@@ -2572,20 +2572,26 @@ function sidelineMissionCandidate(event, id) {
 // A fresh scan must not inherit an older scan's completeness or erase a review.
 function replaceMissionCandidateEvidence(existing, candidate) {
   const history = Array.isArray(existing.terrainReviewHistory) ? existing.terrainReviewHistory.slice() : [];
-  history.push(JSON.parse(JSON.stringify({
-    scannedAt: existing.scannedAt, terrainReviewStatus: existing.terrainReviewStatus,
-    qualifyingSamples: existing.qualifyingSamples, flags: existing.flags, catAccess: existing.catAccess,
-  })));
+  const { terrainReviewHistory: priorHistory, ...priorRecord } = existing;
+  history.push(JSON.parse(JSON.stringify(priorRecord)));
   const reviewed = existing.verdict === 'reject' || existing.rejectedAt
     || (candidate.verdict !== 'reject' && (existing.manualReview
       || (existing.verdict === 'sideline' && existing.rejectReason)));
   const savedReview = reviewed ? {
-    verdict: existing.verdict, rejectReason: existing.rejectReason,
-    rejectedAt: existing.rejectedAt, manualReview: existing.manualReview,
+    verdict: existing.verdict, rejectReason: existing.rejectReason || candidate.rejectReason,
+    rejectedAt: existing.rejectedAt || candidate.rejectedAt, manualReview: existing.manualReview,
   } : {};
   const terrainReviewStatus = ['complete', 'data_review'].includes(candidate.terrainReviewStatus)
     ? candidate.terrainReviewStatus : 'unknown';
   Object.assign(existing, candidate, { id: existing.id, terrainReviewStatus, terrainReviewHistory: history }, savedReview);
+  existing.flags = Array.isArray(existing.flags) ? [...existing.flags] : [];
+  if (savedReview.verdict === 'reject' && priorRecord.flags?.includes('inside_rejected_area')
+    && !existing.flags.includes('inside_rejected_area')) existing.flags.unshift('inside_rejected_area');
+  if (existing.landCheck?.status === 'matched') {
+    existing.flags = existing.flags.filter(flag => flag !== 'parcel_status_unknown');
+    if (existing.landCheck.landPath === 'permit_path' && !existing.flags.includes('public_land_requires_permission'))
+      existing.flags.push('public_land_requires_permission');
+  }
   return existing;
 }
 

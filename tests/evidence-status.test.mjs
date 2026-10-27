@@ -69,6 +69,35 @@ test('an earlier manual promotion cannot override a fresh exclusion', () => {
   assert.equal(existing.manualReview.decision, 'promote');
 });
 
+test('replacement retains complete prior evidence without recursively nesting history', () => {
+  const existing = {id: 'kept', lat: 45, lng: -112, verticalM: 170, score: 40, verdict: 'sideline',
+    footprint: [[45, -112]], cellId: 'old-cell', agent: 'old-agent', elevationMinM: 100,
+    elevationMaxM: 270, clusterSpanM: 200, landCheck: {status: 'matched', parcels: [{parcelId: 'P'}]},
+    terrainReviewHistory: [{scannedAt: 'earliest'}]};
+  const previous = JSON.parse(JSON.stringify(existing));
+  const oldFootprint = existing.footprint;
+  replaceEvidence(existing, {lat: 45.001, lng: -112.001, verticalM: 200, score: 50,
+    footprint: [[45.001, -112.001]], verdict: 'advance', flags: []});
+  delete previous.terrainReviewHistory;
+  assert.deepEqual(JSON.parse(JSON.stringify(existing.terrainReviewHistory[1])), previous);
+  assert.equal(existing.terrainReviewHistory[0].scannedAt, 'earliest');
+  oldFootprint[0][0] = 99;
+  assert.equal(existing.terrainReviewHistory[1].footprint[0][0], 45);
+});
+
+test('retained exclusions and matched land evidence keep their explanatory flags', () => {
+  const existing = {id: 'kept', verdict: 'reject', flags: ['inside_rejected_area'],
+    landCheck: {status: 'matched', landPath: 'permit_path'}};
+  replaceEvidence(existing, {verdict: 'reject', rejectReason: 'new exclusion reason',
+    rejectedAt: 'today', flags: ['parcel_status_unknown', 'legal_access_unverified']});
+  assert.equal(existing.rejectReason, 'new exclusion reason');
+  assert.equal(existing.rejectedAt, 'today');
+  assert.ok(existing.flags.includes('inside_rejected_area'));
+  assert.ok(existing.flags.includes('public_land_requires_permission'));
+  assert.ok(existing.flags.includes('legal_access_unverified'));
+  assert.ok(!existing.flags.includes('parcel_status_unknown'));
+});
+
 test('legacy percentages do not imply complete evidence or legal access', () => {
   for (const confidence of [0.35, 0.58, undefined]) {
     const record = Object.freeze({ confidence, qualifyingSamples: 6, flags: [] });

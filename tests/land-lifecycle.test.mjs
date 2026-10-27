@@ -354,3 +354,59 @@ test('actual launch exit releases stopping controls and labels retained results 
   assert.equal(s.elements.get('missionLandBtn').disabled,false);
   assert.match(s.elements.get('missionStatus').textContent,/Stopped/);
 });
+
+
+test('Resume Mission retains a stopped mission and its candidates, decisions, evidence and original search settings',async()=>{
+  const original=lead('retained',{verdict:'reject',rejectReason:'Keep exclusion',landCheck:validLand('retained-source'),
+    landCheckHistory:[validLand('older-source')],manualReview:{source:'candidate',verdict:'reject',reason:'Keep exclusion'},
+    manualReviewHistory:[{decision:{reason:'Keep exclusion'}}],terrainReviewHistory:[{score:40}]});
+  const s=setup([original]);s.load();const mission=s.context.reconMission;
+  Object.assign(mission,{status:'stopped',cellKm:12,radiusKm:18,center:{lat:45,lng:-112},minElevation:750,
+    cells:[{id:'done',status:'complete',attempts:1},{id:'todo',status:'pending',attempts:0}],errors:2,rejected:3});
+  const before=clone(mission),finish=installLaunch(s),launch=s.context.launchReconMission();
+  assert.equal(s.context.reconMission,mission);assert.equal(mission.status,'running');
+  for(const key of ['id','center','radiusKm','cellKm','minElevation','candidates','exclusions','errors','rejected','cells'])
+    assert.deepEqual(clone(mission[key]),before[key],key);
+  finish();await launch;
+  assert.deepEqual(s.saved().candidates,before.candidates);assert.equal(s.saved().id,before.id);
+  assert.equal(s.saved().status,'complete');assert.deepEqual(s.saved().exclusions,before.exclusions);
+});
+
+test('stopped mission survives reload and cannot be silently replaced by a different region',async()=>{
+  const c=lead('retained',{manualReviewHistory:[{decision:{reason:'Saved decision'}}],landCheck:validLand('saved-source')});
+  const s=setup([c]);s.load();Object.assign(s.context.reconMission,{status:'stopped',cellKm:12,minElevation:700});
+  s.context.saveReconMission();s.load();const mission=s.context.reconMission,before=s.stored.get('mission'),saves=s.saves.length;
+  installLaunch(s);s.context.currentRegion='japan';let workers=0;s.context.runMissionWorker=async()=>{workers++;};
+  await s.context.launchReconMission();
+  assert.equal(s.context.reconMission,mission);assert.equal(mission.status,'stopped');assert.equal(workers,0);
+  assert.equal(s.saves.length,saves);assert.equal(s.stored.get('mission'),before);
+  assert.match(s.logs.at(-1).message,/saved mission region/i);
+});
+
+test('resuming a stopped mission preserves the current bulk request owner and joins its pending land check',async()=>{
+  let finishLand;const s=setup([lead('same',{landCheckHistory:[validLand('prior')]})],()=>new Promise(resolve=>finishLand=resolve));
+  s.load();Object.assign(s.context.reconMission,{status:'stopped',cellKm:12});
+  const oldMission=s.context.reconMission,bulk=s.context.checkMissionLand(),operation=s.context.missionLandBatch;
+  const finishWorkers=installLaunch(s),launch=s.context.launchReconMission();
+  assert.equal(s.context.reconMission,oldMission);assert.equal(s.context.missionLandBatch,operation);
+  const joined=s.context.checkMissionCandidateLand('same',{silent:true});assert.equal(s.requests.length,1);
+  finishLand(response('same-source'));await Promise.all([bulk,joined]);finishWorkers();await launch;
+  assert.equal(s.saved().candidates[0].landCheck.parcels[0].parcelId,'same-source');
+  assert.equal(s.saved().candidates[0].landCheckHistory.length,1);assert.equal(s.requests.length,1);
+  assert.equal(s.context.missionLandBatch,null);assert.equal(s.elements.get('missionLandBtn').disabled,false);
+});
+
+test('resumed actual workers scan only unfinished cells without resetting completed coverage or retained history',async()=>{
+  const c=lead('retained',{lat:47,manualReviewHistory:[{decision:{reason:'Keep'}}],landCheck:validLand('retained-source')});
+  const s=setup([c],async()=>response('new-source'));s.load();installLaunch(s);installWorker(s);
+  const scanned=[];s.context.RunEngine.scanZones=async bounds=>{scanned.push(bounds.tag);return [];};
+  s.context.RunEngine.clusterZones=()=>[];
+  const cells=[{id:'done',status:'complete',attempts:1},{id:'rejected',status:'rejected',attempts:1},
+    {id:'exhausted',status:'error',attempts:2},{id:'pending',status:'pending',attempts:0,bounds:{tag:'pending'}},
+    {id:'retry',status:'error',attempts:1,bounds:{tag:'retry'}}];
+  Object.assign(s.context.reconMission,{status:'stopped',cellKm:12,cells});const mission=s.context.reconMission;
+  await s.context.launchReconMission();
+  assert.equal(s.context.reconMission,mission);assert.deepEqual(scanned.sort(),['pending','retry']);
+  assert.equal(cells[0].attempts,1);assert.equal(cells[1].attempts,1);assert.equal(cells[2].attempts,2);
+  assert.deepEqual(s.saved().candidates,[c]);assert.equal(s.saved().status,'complete');
+});

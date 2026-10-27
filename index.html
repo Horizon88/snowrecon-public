@@ -2475,7 +2475,13 @@ async function launchReconMission() {
   const radiusKm = +document.getElementById('missionRadius').value;
   const minElevation = currentRegion === 'japan' ? 250 : +document.getElementById('baseElevSlider').value;
   const cellKm = currentRegion === 'japan' ? 4 : 12;
-  if (!reconMission || reconMission.status === 'complete' || reconMission.status === 'stopped' || reconMission.cellKm !== cellKm) {
+  // Resume uses the stopped mission's saved cells, candidates and review history.
+  // Its sampling mode must still match the selected region.
+  if (reconMission?.status === 'stopped' && reconMission.cellKm !== cellKm) {
+    log('Switch back to the saved mission region to resume; its results and reviews are retained.', 'warn');
+    return;
+  }
+  if (!reconMission || reconMission.status === 'complete' || reconMission.cellKm !== cellKm) {
     const priorExclusions = reconMission?.exclusions || [];
     resetMissionLandBatch();
     reconMission = {

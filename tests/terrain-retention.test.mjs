@@ -86,10 +86,10 @@ async function runWorker(scan, zones) {
   const actualEngine=engine(), cell={id:'test',bounds,status:'pending',attempts:0};
   const state={cells:[cell],candidates:[],rejected:0,errors:0,minElevation:250};
   let receivedOptions;
-  const context=vm.createContext({ console, setTimeout, missionStopRequested:false, missionPaused:false, currentRegion:'japan', reconMission:state,
+  const context=vm.createContext({ console, setTimeout, missionStopRequested:false, missionPaused:false, missionStorageFailed:false, currentRegion:'japan', reconMission:state,
     RunEngine:{ setZoneSensitivity(){}, scanZones:async (_b,_g,_p,opts)=>{receivedOptions=opts;return scan;}, clusterZones:()=>zones,
       screenMissionZones:actualEngine.screenMissionZones, fetchRoads:async()=>[] },
-    renderMissionCockpit(){},saveReconMission(){},drawMissionCandidates(){},missionCandidateSort:()=>0,
+    renderMissionCockpit(){},saveReconMission(){return true;},drawMissionCandidates(){},missionCandidateSort:()=>0,
     missionHash:(lat,lng)=>`${lat}:${lng}`,findMissionExclusion:()=>null,missionDistanceM:()=>1000,checkMissionCandidateLand:async()=>{} });
   vm.runInContext(workerSource,context); await context.runMissionWorker('test-agent');
   return {state,cell,receivedOptions};
@@ -169,12 +169,12 @@ async function retryHarness({verdict='reject',complete=false,running=false,exclu
     exclusions:[{id:'saved-exclusion'}],rejected:1,errors:0};
   const elements=new Map();const element=id=>{if(!elements.has(id))elements.set(id,{value:id==='missionPreset'?'current':'4',style:{}});return elements.get(id);};
   const actual=engine();let scans=0,cleared;
-  const context=vm.createContext({console,setTimeout,document:{getElementById:element},missionRunning:running,missionPaused:false,missionStopRequested:false,currentRegion:'japan',reconMission:mission,
+  const context=vm.createContext({console,setTimeout,document:{getElementById:element},missionRunning:running,missionPaused:false,missionStopRequested:false,missionStorageFailed:false,currentRegion:'japan',reconMission:mission,
     MISSION_PRESETS:{},map:{getCenter:()=>({lat:43,lng:141})},missionCellGrid:()=>{throw Error('Existing mission must not reset');},
     RunEngine:{retryIncompleteDEMTiles:keys=>{cleared=keys;},setZoneSensitivity(){},scanZones:async()=>{scans++;return {samples:[],coverage:{complete,incompleteTileKeys:complete?[]:['14/1/2']}};},clusterZones:()=>[zone],screenMissionZones:actual.screenMissionZones,fetchRoads:async()=>[]},
-    renderMissionCockpit(){},saveReconMission(){},drawMissionCandidates(){},missionCandidateSort:()=>0,missionHash:()=> 'new-id',findMissionExclusion:()=>exclusionReason?{reason:exclusionReason}:null,missionDistanceM:()=>0,checkMissionCandidateLand:async()=>{},alert:message=>{throw Error(message);} });
+    renderMissionCockpit(){},saveReconMission(){return true;},drawMissionCandidates(){},missionCandidateSort:()=>0,missionHash:()=> 'new-id',findMissionExclusion:()=>exclusionReason?{reason:exclusionReason}:null,missionDistanceM:()=>0,checkMissionCandidateLand:async()=>{},alert:message=>{throw Error(message);} });
   const lifecycle=html.slice(html.indexOf('async function retryMissionDataReview('),html.indexOf('function toggleMissionPause('));
-  vm.runInContext(lifecycle,context);await context.launchReconMission();return {state:context.reconMission,scans,cleared};
+  vm.runInContext(lifecycle,context);await context.retryMissionDataReview();return {state:context.reconMission,scans,cleared};
 }
 test('explicit retry preserves mission, decisions, exclusions and prior evidence without automatic loops',async()=>{
   const {state,scans,cleared}=await retryHarness();
@@ -202,4 +202,74 @@ test('a saved sidelining decision cannot override a mapped exclusion found on re
   const {state}=await retryHarness({verdict:'sideline',complete:true,exclusionReason:'Saved excluded area'});
   assert.equal(state.candidates[0].verdict,'reject');assert.equal(state.candidates[0].rejectReason,'Saved excluded area');
   assert.equal(state.retryHistory[0].candidates[0].verdict,'sideline');
+});
+
+const saveSource=html.slice(html.indexOf('function saveReconMission('),html.indexOf('function loadReconMission('));
+const lifecycleSource=html.slice(html.indexOf('async function retryMissionDataReview('),html.indexOf('function toggleMissionPause('));
+function storageHarness({failAt=Infinity,region='japan',preset='current'}={}) {
+  const original={id:'original',name:'Original',status:'complete',cellKm:4,minElevation:250,
+    cells:[{id:'needs-data',bounds,status:'data_review',attempts:1,coverage:{complete:false,incompleteTileKeys:['14/1/2']}}],
+    candidates:[{id:'affected',cellId:'needs-data',lat:43,lng:141,verdict:'reject',score:2,footprint:[[43,141]],rejectReason:'Keep my rejection'},
+      {id:'unrelated',cellId:'other-cell',footprint:Array(50).fill([44,140]),verdict:'sideline'}],
+    retryHistory:Array.from({length:7},(_,i)=>({id:`prior-${i}`,evidence:'preserve'})),exclusions:[{id:'keep-excluded'}],rejected:0,errors:0};
+  const elements=new Map();const element=id=>{if(!elements.has(id))elements.set(id,{value:id==='missionPreset'?preset:id==='missionRadius'?'12':'250',disabled:false,hidden:true,style:{}});return elements.get(id);};
+  const initial=JSON.stringify(original),values=new Map([['mission',initial]]),writes=[];
+  let attempts=0,scans=0,clears=0,gridCalls=0;
+  const actual=engine();
+  const context=vm.createContext({console,setTimeout,MISSION_KEY:'mission',missionRunning:false,missionPaused:false,missionStopRequested:false,missionStorageFailed:false,
+    currentRegion:region,reconMission:original,document:{getElementById:element},
+    localStorage:{getItem:key=>values.get(key),setItem:(key,value)=>{attempts++;if(attempts>=failAt)throw new Error('QuotaExceededError');values.set(key,value);writes.push(value);},removeItem:key=>values.delete(key)},
+    MISSION_PRESETS:{idaho:{lat:45.05,lng:-115.55,name:'Central Idaho'}},map:{getCenter:()=>({lat:43,lng:141})},
+    missionCellGrid:()=>{gridCalls++;return [];},RunEngine:{retryIncompleteDEMTiles:()=>{clears++;},setZoneSensitivity(){},scanZones:async()=>{scans++;return {samples:[],coverage:{complete:false,incompleteTileKeys:['14/1/2']}};},clusterZones:()=>[],screenMissionZones:actual.screenMissionZones},
+    renderMissionCockpit(){},drawMissionCandidates(){},missionCandidateSort:()=>0,alert:message=>{throw Error(message);} });
+  vm.runInContext(saveSource+lifecycleSource,context);
+  return {context,original,initial,values,writes,element,stats:()=>({attempts,scans,clears,gridCalls})};
+}
+test('Launch new preset bypasses retry and preserves exclusions',async()=>{
+  const h=storageHarness({preset:'idaho'});await h.context.launchReconMission();
+  assert.notEqual(h.context.reconMission.id,'original');assert.equal(h.context.reconMission.name,'Central Idaho');
+  assert.equal(h.context.reconMission.exclusions[0].id,'keep-excluded');assert.equal(h.stats().gridCalls,1);
+  assert.equal(h.stats().clears,0);assert.equal(h.context.missionRunning,false);
+});
+test('Launch after region switch creates new mission without requiring Clear',async()=>{
+  const h=storageHarness({region:'usa',preset:'idaho'});await h.context.launchReconMission();
+  assert.equal(h.context.reconMission.cellKm,12);assert.equal(h.context.reconMission.exclusions[0].id,'keep-excluded');
+  assert.equal(h.stats().gridCalls,1);assert.equal(h.stats().clears,0);
+});
+test('quota failure before retry leaves original state, history, saved bytes and cache intact',async()=>{
+  const h=storageHarness({failAt:1});await h.context.retryMissionDataReview();
+  assert.equal(h.context.reconMission,h.original);assert.equal(JSON.stringify(h.original),h.initial);
+  assert.equal(h.values.get('mission'),h.initial);assert.equal(h.stats().scans,0);assert.equal(h.stats().clears,0);
+  assert.equal(h.context.missionRunning,false);assert.equal(h.element('missionLaunchBtn').disabled,false);
+  assert.equal(h.element('missionStorageError').hidden,false);assert.match(h.element('missionStorageError').textContent,/last saved mission is preserved/);
+});
+test('quota failure before new mission launch does not replace saved or current mission',async()=>{
+  const h=storageHarness({failAt:1,preset:'idaho'});await h.context.launchReconMission();
+  assert.equal(h.context.reconMission,h.original);assert.equal(JSON.stringify(h.original),h.initial);
+  assert.equal(h.values.get('mission'),h.initial);assert.equal(h.context.missionRunning,false);
+  assert.equal(h.stats().scans,0);assert.equal(h.element('missionLaunchBtn').disabled,false);
+});
+for(const failAt of [2,3,4]) test(`quota failure at write ${failAt} stops safely and releases launch/retry controls`,async()=>{
+  const h=storageHarness({failAt});await h.context.retryMissionDataReview();
+  assert.equal(h.context.missionRunning,false);assert.equal(h.context.missionStopRequested,true);
+  assert.equal(h.context.missionStorageFailed,true);assert.equal(h.element('missionStorageError').hidden,false);
+  assert.equal(h.element('missionLaunchBtn').disabled,false);assert.equal(h.element('missionRetryBtn').disabled,false);
+  assert.equal(h.values.get('mission'),h.writes.at(-1));assert.equal(h.stats().attempts,failAt);
+  assert.ok(h.stats().scans<=1);assert.equal(h.context.reconMission.exclusions[0].id,'keep-excluded');
+  assert.equal(h.context.reconMission.candidates[0].rejectReason,'Keep my rejection');
+  assert.equal(h.context.reconMission.retryHistory.length,8);
+});
+test('retry history preserves every old entry and snapshots only affected candidate evidence',async()=>{
+  const h=storageHarness();await h.context.retryMissionDataReview();
+  const state=h.context.reconMission;assert.equal(state.retryHistory.length,8);
+  assert.deepEqual(JSON.parse(JSON.stringify(state.retryHistory.slice(0,7))),h.original.retryHistory);
+  assert.deepEqual(Array.from(state.retryHistory[7].candidates,c=>c.id),['affected']);
+  assert.deepEqual(JSON.parse(JSON.stringify(state.retryHistory[7].candidates[0].footprint)),[[43,141]]);
+  assert.equal(state.candidates[1].footprint.length,50);assert.equal(h.context.missionRunning,false);
+});
+test('retry and export are separate explicit controls',()=>{
+  assert.match(html, /id="missionRetryBtn" onclick="retryMissionDataReview\(\)"/);
+  assert.match(html, /onclick="exportReconMission\(\)"/);
+  const launch=html.slice(html.indexOf('async function launchReconMission('),html.indexOf('async function startReconMission('));
+  assert.doesNotMatch(launch,/return retryMissionDataReview/);
 });

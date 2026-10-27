@@ -242,6 +242,11 @@
       <button class="btn" onclick="clearReconMission()">Clear</button>
     </div>
     <div style="font-size:8px;color:var(--dim);margin:-2px 0 6px">Japan uses smaller 4 km search cells. Zoom around Yotei and choose <b style="color:var(--red)">Reject View</b> to exclude that area permanently.</div>
+    <div style="display:flex;gap:5px;margin-bottom:6px">
+      <button class="btn" id="missionRetryBtn" onclick="retryMissionDataReview()" hidden>Retry data review</button>
+      <button class="btn" onclick="exportReconMission()">Export mission JSON</button>
+    </div>
+    <p id="missionStorageError" role="alert" style="color:var(--red);font-size:11px" hidden></p>
     <div id="missionPanel" style="display:none;margin-bottom:8px">
       <div class="mission-progress"><div id="missionProgressBar"></div></div>
       <div id="missionStatus" style="font-size:9px;color:var(--orange);margin:4px 0">Preparing…</div>
@@ -2148,6 +2153,7 @@ let reconMission = null;
 let missionRunning = false;
 let missionPaused = false;
 let missionStopRequested = false;
+let missionStorageFailed = false;
 let missionLayer = L.layerGroup().addTo(map);
 let missionParcelLayer = L.layerGroup().addTo(map);
 const missionParcelGeometry = new Map();
@@ -2353,9 +2359,30 @@ function missionDistanceM(a, b) {
     (a.lng - b.lng) * 111320 * Math.cos(lat));
 }
 
-function saveReconMission() {
-  if (!reconMission) return localStorage.removeItem(MISSION_KEY);
-  localStorage.setItem(MISSION_KEY, JSON.stringify(reconMission));
+function saveReconMission(snapshot = reconMission) {
+  try {
+    if (!snapshot) localStorage.removeItem(MISSION_KEY);
+    else localStorage.setItem(MISSION_KEY, JSON.stringify(snapshot));
+    missionStorageFailed = false;
+    const message=document.getElementById('missionStorageError');
+    if(message) message.hidden=true;
+    return true;
+  } catch (_) {
+    missionStorageFailed = true; missionStopRequested = true;
+    const message=document.getElementById('missionStorageError');
+    if(message) {
+      message.hidden=false;
+      message.textContent='Mission could not be saved: browser storage is full or unavailable. Research has stopped. Your last saved mission is preserved; export the current evidence before deliberately clearing anything.';
+    }
+    return false;
+  }
+}
+
+function exportReconMission() {
+  if (!reconMission) return;
+  const url=URL.createObjectURL(new Blob([JSON.stringify(reconMission,null,2)],{type:'application/json'}));
+  const link=document.createElement('a'); link.href=url; link.download=`${reconMission.id || 'recon-mission'}.json`;
+  link.click(); setTimeout(()=>URL.revokeObjectURL(url),1000);
 }
 
 function loadReconMission() {
@@ -2384,30 +2411,30 @@ async function retryMissionDataReview() {
   if (reconMission.cellKm !== (currentRegion === 'japan' ? 4 : 12)) {
     alert('Switch to this mission’s original region before retrying its data review.'); return;
   }
-  // Preserve the exact prior evidence before explicit remeasurement.
-  reconMission.retryHistory ||= [];
-  reconMission.retryHistory.push(JSON.parse(JSON.stringify({ at:new Date().toISOString(),
-    cells, candidates:reconMission.candidates, reason:'explicit_data_review_retry' })));
-  RunEngine.retryIncompleteDEMTiles(cells.flatMap(c=>c.coverage?.incompleteTileKeys || []));
-  cells.forEach(c=>{ c.status='pending'; c.agent=null; });
-  reconMission.status='paused';
-  await launchReconMission();
+  // Prepare a separate state. A failed storage preflight changes neither the
+  // active mission nor its cache. Existing history is never capped or removed.
+  const next=JSON.parse(JSON.stringify(reconMission)), ids=new Set(cells.map(c=>c.id));
+  next.retryHistory ||= [];
+  next.retryHistory.push(JSON.parse(JSON.stringify({ at:new Date().toISOString(), cells,
+    candidates:reconMission.candidates.filter(c=>!c.cellId || ids.has(c.cellId)), reason:'explicit_data_review_retry' })));
+  const retryTiles=cells.flatMap(c=>c.coverage?.incompleteTileKeys || []);
+  next.cells.filter(c=>ids.has(c.id)).forEach(c=>{ c.status='pending'; c.agent=null; });
+  next.status='running';
+  await startReconMission(next,retryTiles);
 }
 
 async function launchReconMission() {
   if (missionRunning) return;
-  if (reconMission && ['complete','stopped'].includes(reconMission.status) && reconMission.cells.some(c=>c.status==='data_review')) {
-    return retryMissionDataReview();
-  }
   const presetKey = document.getElementById('missionPreset').value;
   const preset = presetKey === 'current' ? null : MISSION_PRESETS[presetKey];
   const center = preset || { lat: map.getCenter().lat, lng: map.getCenter().lng, name: 'Current map area' };
   const radiusKm = +document.getElementById('missionRadius').value;
   const minElevation = currentRegion === 'japan' ? 250 : +document.getElementById('baseElevSlider').value;
   const cellKm = currentRegion === 'japan' ? 4 : 12;
+  let next;
   if (!reconMission || reconMission.status === 'complete' || reconMission.status === 'stopped' || reconMission.cellKm !== cellKm) {
     const priorExclusions = reconMission?.exclusions || [];
-    reconMission = {
+    next = {
       version: 1, id: `mission-${Date.now()}`, name: center.name || 'Recon mission',
       createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
       center: { lat: center.lat, lng: center.lng }, radiusKm, cellKm,
@@ -2415,22 +2442,36 @@ async function launchReconMission() {
       candidates: [], exclusions: priorExclusions, rejected: 0, errors: 0,
     };
   } else {
-    reconMission.status = 'running';
+    next=JSON.parse(JSON.stringify(reconMission)); next.status='running';
   }
+  await startReconMission(next);
+}
+
+async function startReconMission(next,retryTiles=[]) {
+  if (missionRunning || !saveReconMission(next)) return false;
+  reconMission=next;
   missionRunning = true; missionPaused = false; missionStopRequested = false;
   document.getElementById('missionPanel').style.display = 'block';
   document.getElementById('missionPauseBtn').disabled = false;
   document.getElementById('missionLaunchBtn').disabled = true;
-  renderMissionCockpit(); saveReconMission();
-  await Promise.all([runMissionWorker('Alpine-1'), runMissionWorker('Alpine-2')]);
-  if (!missionStopRequested && reconMission.cells.every(c => ['complete','rejected','error','data_review'].includes(c.status))) {
-    reconMission.status = 'complete';
+  document.getElementById('missionRetryBtn').disabled = true;
+  try {
+    if(retryTiles.length) RunEngine.retryIncompleteDEMTiles(retryTiles);
+    renderMissionCockpit();
+    await Promise.all([runMissionWorker('Alpine-1'), runMissionWorker('Alpine-2')]);
+    if (!missionStopRequested && reconMission.cells.every(c => ['complete','rejected','error','data_review'].includes(c.status))) {
+      reconMission.status = 'complete';
+    }
+  } finally {
+    missionRunning = false; missionPaused = false;
+    if(missionStorageFailed) reconMission.status='paused';
+    document.getElementById('missionLaunchBtn').disabled = false;
+    document.getElementById('missionRetryBtn').disabled = false;
+    document.getElementById('missionPauseBtn').disabled = true;
+    if(!missionStorageFailed) saveReconMission();
+    renderMissionCockpit();
   }
-  missionRunning = false;
-  document.getElementById('missionLaunchBtn').disabled = false;
-  document.getElementById('missionLaunchBtn').textContent = reconMission.status === 'complete' ? 'Mission Complete' : 'Resume Mission';
-  document.getElementById('missionPauseBtn').disabled = true;
-  saveReconMission(); renderMissionCockpit();
+  return !missionStorageFailed;
 }
 
 async function runMissionWorker(agentName) {
@@ -2438,9 +2479,14 @@ async function runMissionWorker(agentName) {
     while (missionPaused && !missionStopRequested) await new Promise(r => setTimeout(r, 350));
     const cell = reconMission.cells.find(c => c.status === 'pending' || (c.status === 'error' && c.attempts < 2));
     if (!cell) return;
+    const priorClaim={status:cell.status,agent:cell.agent,attempts:cell.attempts,updatedAt:reconMission.updatedAt};
     cell.status = 'running'; cell.agent = agentName; cell.attempts++;
     reconMission.updatedAt = new Date().toISOString();
-    renderMissionCockpit(); saveReconMission();
+    if (!saveReconMission()) {
+      cell.status=priorClaim.status; cell.agent=priorClaim.agent; cell.attempts=priorClaim.attempts;
+      reconMission.updatedAt=priorClaim.updatedAt; return;
+    }
+    renderMissionCockpit();
     try {
       RunEngine.setZoneSensitivity(12, 180);
       // Keep sample spacing below the clustering radius. The first mission build
@@ -2533,7 +2579,8 @@ async function runMissionWorker(agentName) {
     } finally {
       reconMission.candidates.sort(missionCandidateSort);
       reconMission.updatedAt = new Date().toISOString();
-      saveReconMission(); renderMissionCockpit(); drawMissionCandidates();
+      if(!missionStorageFailed) saveReconMission();
+      renderMissionCockpit(); drawMissionCandidates();
     }
   }
 }
@@ -2555,7 +2602,8 @@ function clearReconMission() {
     return;
   }
   missionStopRequested = true; missionRunning = false; missionPaused = false;
-  reconMission = null; localStorage.removeItem(MISSION_KEY);
+  if(!saveReconMission(null)) return;
+  reconMission = null;
   missionLayer.clearLayers();
   missionParcelLayer.clearLayers(); missionParcelGeometry.clear();
   document.getElementById('missionPanel').style.display = 'none';
@@ -2614,10 +2662,13 @@ function renderMissionCockpit() {
   document.getElementById('missionErrors').textContent = reconMission.errors;
   const active = reconMission.cells.filter(c => c.status === 'running').map(c => `${c.agent}: ${c.id}`).join(' · ');
   const dataReview = reconMission.cells.filter(c => c.status === 'data_review').length;
-  if (!missionRunning) document.getElementById('missionLaunchBtn').textContent = dataReview && ['complete','stopped'].includes(reconMission.status)
-    ? 'Retry data review' : reconMission.status === 'complete' ? 'Mission Complete' : 'Resume Mission';
+  document.getElementById('missionRetryBtn').hidden = dataReview === 0;
+  document.getElementById('missionRetryBtn').disabled = missionRunning;
+  if (!missionRunning) document.getElementById('missionLaunchBtn').textContent = ['complete','stopped'].includes(reconMission.status) ? 'Launch New Mission' : 'Resume Mission';
   const purchaseLeads = reconMission.candidates.filter(c => c.landCheck?.landPath === 'purchase_lead').length;
-  document.getElementById('missionStatus').textContent = reconMission.status === 'complete'
+  document.getElementById('missionStatus').textContent = missionStorageFailed
+    ? 'Stopped · latest save not confirmed. Export current evidence before clearing.'
+    : reconMission.status === 'complete'
     ? `Complete · ${reconMission.name} · ${reconMission.candidates.length} terrain leads · ${purchaseLeads} private purchase leads · ${dataReview} cells need data review`
     : missionPaused ? 'Paused · progress saved locally' : (active || 'Workers preparing next cells…') + (dataReview ? ` · ${dataReview} cells need data review` : '');
   const reports = document.getElementById('missionReports');

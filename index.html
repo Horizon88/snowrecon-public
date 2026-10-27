@@ -2163,6 +2163,7 @@ function landCheckLabel(candidate) {
   if (land.status === 'unsupported_jurisdiction') return 'Parcel adapter not connected here';
   if (land.status === 'no_parcel_at_point') return 'No mapped parcel at candidate center';
   if (land.status === 'error') return `Land check error: ${land.error || 'retry'}`;
+  if (land.status === 'incomplete') return 'Parcel evidence incomplete · recheck needed';
   if (land.status !== 'matched') return 'Land status unknown';
   const p = firstMissionParcel(land);
   if (!p) return 'Parcel evidence incomplete · recheck needed';
@@ -2286,7 +2287,12 @@ async function checkMissionCandidateLand(candidateId, options = {}) {
         message: payload.message, provider: payload.provider || null, parcels: [], score25: 0,
         combinedScore: Math.round(candidate.score * .75), landPath: 'unsupported', landPathLabel: 'Parcel adapter unavailable'
       };
-    } else if (!payload.parcels?.length) {
+    } else if (!firstMissionParcel(payload) && (payload.status === 'matched' || !Array.isArray(payload.parcels) || payload.parcels.length)) {
+      // Preserve an incomplete response for review without treating it as no match.
+      candidate.landCheck = { ...payload, status: payload.status || 'incomplete', queryPosition,
+        fitStatus: 'incomplete_parcel_evidence', score25: null, combinedScore: null,
+        landPath: 'unknown', landPathLabel: 'Parcel evidence incomplete' };
+    } else if (!payload.parcels.length) {
       candidate.landCheck = {
         status: payload.status || 'no_parcel_at_point', checkedAt: payload.checkedAt, queryPosition,
         provider: payload.provider, jurisdiction: payload.jurisdiction, parcels: [], score25: 0,
@@ -2296,10 +2302,13 @@ async function checkMissionCandidateLand(candidateId, options = {}) {
       const fit = scoreLandFit(candidate, payload);
       candidate.landCheck = {
         status: 'matched', checkedAt: payload.checkedAt, provider: payload.provider,
-        jurisdiction: payload.jurisdiction, parcels: payload.parcels.map(({ geometry, ...parcel }) => parcel),
+        jurisdiction: payload.jurisdiction, parcels: payload.parcels.map(p => {
+          if (!p || typeof p !== 'object' || Array.isArray(p)) return p;
+          const { geometry, ...parcel } = p; return parcel;
+        }),
         ...fit, queryPosition, legalAccess: 'unverified', titleVerified: false, availability: 'unknown'
       };
-      missionParcelGeometry.set(candidate.id, payload.parcels.map(p => p.geometry).filter(Boolean));
+      missionParcelGeometry.set(candidate.id, payload.parcels.map(p => p?.geometry).filter(Boolean));
       candidate.flags = candidate.flags.filter(flag => flag !== 'parcel_status_unknown');
       if (fit.landPath === 'permit_path' && !candidate.flags.includes('public_land_requires_permission')) candidate.flags.push('public_land_requires_permission');
     }
@@ -2317,7 +2326,7 @@ async function checkMissionCandidateLand(candidateId, options = {}) {
 async function checkMissionLand() {
   if (!reconMission?.candidates?.length) { log('Run a Recon Mission first; land checks attach to ranked terrain leads.', 'warn'); return; }
   const button = document.getElementById('missionLandBtn');
-  const queue = reconMission.candidates.filter(c => c.landCheck?.status !== 'matched').slice(0, 30);
+  const queue = reconMission.candidates.filter(c => !(c.landCheck?.status === 'matched' && firstMissionParcel(c.landCheck))).slice(0, 30);
   if (!queue.length) { drawMissionCandidates(); log('All ranked leads already have land checks.', 'ok'); return; }
   button.disabled = true;
   for (let i = 0; i < queue.length; i += 3) {
@@ -2327,7 +2336,7 @@ async function checkMissionLand() {
     renderMissionCockpit(); drawMissionCandidates();
   }
   button.disabled = false; button.textContent = 'Check Land';
-  const matches = reconMission.candidates.filter(c => c.landCheck?.status === 'matched').length;
+  const matches = reconMission.candidates.filter(c => c.landCheck?.status === 'matched' && firstMissionParcel(c.landCheck)).length;
   log(`Official parcel screening complete: ${matches} candidate centers matched to mapped parcels. Title, availability and legal access remain unverified.`, matches ? 'ok' : 'warn');
 }
 
@@ -2398,6 +2407,7 @@ function loadReconMission() {
       const d = c.catAccess.distanceKm * 1000, s = c.catAccess.maxSlopeDeg;
       c.catAccess.grade = d <= 2000 && s <= 18 ? 'A' : d <= 4000 && s <= 20 ? 'B' : d <= 7000 && s <= 24 ? 'C' : 'F';
     });
+    reconMission.candidates.sort(missionCandidateSort);
     document.getElementById('missionPanel').style.display = 'block';
     renderMissionCockpit();
     saveReconMission();
@@ -2774,12 +2784,12 @@ function drawMissionCandidates() {
     L.circleMarker([c.lat, c.lng], { radius: 6, color, weight: 2, fillColor: color, fillOpacity: .35 })
       .bindPopup(`<b>Recon lead #${i+1}</b><br>${c.verticalM}m vert · ${c.aspect}<br>${c.catAccess ? 'Access '+(c.catAccess.grade||'?')+' · '+c.catAccess.distanceKm+'km cat route' : 'Access U · unverified'}<br><small>${c.flags.length} open checks</small>`)
       .addTo(missionLayer);
-    const geometries = missionParcelGeometry.get(c.id) || [];
+    const parcel = firstMissionParcel(c.landCheck);
+    const geometries = parcel ? missionParcelGeometry.get(c.id) || [] : [];
     geometries.forEach(geometry => {
-      const parcel = c.landCheck?.parcels?.[0] || {};
       const fill = parcel.ownershipClass === 'private' ? '#06b6d4' : parcel.ownershipClass === 'public' ? '#ef4444' : '#94a3b8';
       L.geoJSON({ type: 'Feature', geometry, properties: {} }, { style: { color: '#67e8f9', weight: 3, fillColor: fill, fillOpacity: .18, dashArray: '5 3' } })
-        .bindPopup(`<b>Official mapped parcel</b><br>${escapeLandText(parcel.ownerName || 'Owner unavailable')}<br>${parcel.acres == null ? 'Acreage unavailable' : parcel.acres.toFixed(1)+' acres'}<br><small>${escapeLandText(c.landCheck?.provider?.name || '')}<br>Not proof of title, availability or legal access.</small>`)
+        .bindPopup(`<b>Official mapped parcel</b><br>${escapeLandText(parcel.ownerName || 'Owner unavailable')}<br>${Number.isFinite(parcel.acres) && parcel.acres >= 0 ? parcel.acres.toFixed(1)+' acres' : 'Acreage unavailable'}<br><small>${escapeLandText(c.landCheck?.provider?.name || '')}<br>Not proof of title, availability or legal access.</small>`)
         .addTo(missionParcelLayer);
     });
   });

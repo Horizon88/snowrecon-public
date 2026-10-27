@@ -16,8 +16,9 @@ function setup(candidates,fetcher=()=>{throw Error('unexpected fetch');}) {
   const layer=()=>({clearLayers(){}});
   const shape=(type,args)=>{const record={type,args};shapes.push(record);return{
     bindPopup(popup){record.popup=popup;return this;},addTo(){return this;}};};
-  const context=vm.createContext({MISSION_KEY:'mission',reconMission:null,missionPaused:false,missionRunning:false,missionParcelGeometry:new Map(),missionLandRequests:new WeakMap(),missionLandBatch:null,
-    document:{getElementById:id=>{if(!elements.has(id))elements.set(id,{style:{},innerHTML:'',textContent:''});return elements.get(id);}},
+  const context=vm.createContext({MISSION_KEY:'mission',reconMission:null,missionActiveRaw:null,missionExportedArchives:null,missionStopRequested:false,missionPaused:false,missionRunning:false,missionParcelGeometry:new Map(),missionLandRequests:new WeakMap(),missionLandBatch:null,
+    Blob,URL:{createObjectURL:()=> 'blob:test',revokeObjectURL(){}},setTimeout:()=>{},confirm:()=>false,
+    document:{createElement:()=>({click(){}}),getElementById:id=>{if(!elements.has(id))elements.set(id,{style:{},innerHTML:'',textContent:''});return elements.get(id);}},
     localStorage:{get length(){return stored.size;},key:i=>[...stored.keys()][i]??null,getItem:key=>stored.get(key),setItem:(key,value)=>{stored.set(key,value);saves.push(JSON.parse(value));},removeItem:key=>stored.delete(key)},
     L:Object.fromEntries(['polygon','circle','circleMarker','geoJSON','rectangle'].map(type=>[type,(...args)=>shape(type,args)])),
     missionLayer:layer(),missionParcelLayer:layer(),log:(message,level)=>logs.push({message,level}),
@@ -480,4 +481,104 @@ test('late parcel result cannot mutate an archived Clear snapshot or launch queu
   s.load();installClear(s);const pending=s.context.checkMissionLand();s.context.clearReconMission();const record=archived(s)[0];assert.ok(record);const bytes=s.stored.get(record.key);
   deferred.forEach(resolve=>resolve(response('late')));await pending;
   assert.equal(s.requests.length,3);assert.equal(s.stored.get(record.key),bytes);assert.equal(s.context.reconMission,null);assert.equal(s.stored.has('mission'),false);
+});
+
+test('successful replacement archive followed by ACTIVE quota failure retains both bytes and releases pre-worker controls',async()=>{
+  const c=lead('old',{manualReviewHistory:[{decision:{reason:'Immutable review'}}]});
+  const s=setup([c]);s.load();installLaunch(s);const before=s.stored.get('mission'),old=clone(s.context.reconMission);
+  let workers=0;s.context.runMissionWorker=async()=>workers++;
+  const set=s.context.localStorage.setItem;s.context.localStorage.setItem=(key,value)=>{if(key==='mission')throw Error('quota after archive');set(key,value);};
+  await s.context.launchReconMission();
+  assert.equal(workers,0);assert.equal(s.context.missionRunning,false);assert.equal(s.context.missionStopRequested,true);
+  assert.equal(s.context.reconMission.status,'stopped');assert.notEqual(s.context.reconMission.id,old.id);
+  assert.equal(s.stored.get('mission'),before);assert.deepEqual(archived(s)[0].mission,old);
+  assert.equal(s.elements.get('missionLaunchBtn').disabled,false);assert.equal(s.elements.get('missionPauseBtn').disabled,true);
+  assert.equal(s.elements.get('missionLandBtn').disabled,false);assert.match(s.elements.get('missionStorageWarning').textContent,/unsaved/);
+  s.context.renderMissionCockpit();assert.equal(s.elements.get('missionStorageWarning').style.display,'block');
+});
+
+for(const raw of ['{broken','42','true','[]','"text"','{}','{"cells":[],"candidates":[null]}','{"cells":[],"candidates":[],"exclusions":{}}']) {
+  for(const action of ['clear','launch'])test(`unreadable ACTIVE ${raw} survives actual load, export and ${action}`,async()=>{
+    const s=setup([]);s.stored.set('mission',raw);assert.doesNotThrow(()=>s.load());
+    assert.equal(s.context.reconMission,null);assert.equal(s.stored.get('mission'),raw);
+    assert.equal(s.context.missionHistoryExport().activeRaw,raw);assert.equal(s.context.saveReconMission(),true);assert.equal(s.stored.get('mission'),raw);
+    installClear(s);const finish=installLaunch(s);
+    if(action==='clear')s.context.clearReconMission();else{const pending=s.context.launchReconMission();finish();await pending;}
+    assert.equal(archived(s).length,1);assert.equal(archived(s)[0].activeRaw,raw);
+    if(action==='clear')assert.equal(s.stored.has('mission'),false);else assert.equal(s.saved().status,'complete');
+  });
+}
+
+for(const action of ['clear','launch'])test(`unreadable ACTIVE cannot be lost by ${action} when its archive fails`,async()=>{
+  const s=setup([]),raw=' { broken exact bytes\n';s.stored.set('mission',raw);s.load();installClear(s);installLaunch(s);
+  s.context.localStorage.setItem=()=>{throw Error('quota');};let workers=0;s.context.runMissionWorker=async()=>workers++;
+  if(action==='clear')s.context.clearReconMission();else await s.context.launchReconMission();
+  assert.equal(workers,0);assert.equal(s.context.reconMission,null);assert.equal(s.stored.get('mission'),raw);
+  assert.equal(s.context.missionHistoryExport().activeRaw,raw);assert.equal(archived(s).length,0);
+});
+
+test('export then explicitly confirmed archive removal recovers quota while cancel, later archives and ACTIVE remain safe',async()=>{
+  const s=setup([lead('a')]);s.load();installClear(s);
+  assert.equal(s.context.archiveReconMission('prior-1'),true);
+  s.context.reconMission.candidates[0].id='b';s.context.saveReconMission();assert.equal(s.context.archiveReconMission('prior-2'),true);
+  s.context.reconMission.candidates[0].id='active';s.context.saveReconMission();const active=s.stored.get('mission');
+  const originalEntries=[...s.stored].filter(([key])=>key.startsWith(historyKey));const set=s.context.localStorage.setItem;
+  let quota=true;s.context.localStorage.setItem=(key,value)=>{if(quota&&key.startsWith(historyKey)&&archived(s).length>=2)throw Error('quota');set(key,value);};
+  s.context.clearReconMission();assert.equal(s.stored.get('mission'),active);assert.equal(archived(s).length,2);
+  s.context.removeExportedMissionArchives();assert.equal(archived(s).length,2);assert.match(s.elements.get('missionStorageWarning').textContent,/Export History first/);
+  let blob,revoked=false,delayed,confirmation;
+  s.context.URL={createObjectURL:value=>{blob=value;return 'blob:export';},revokeObjectURL:()=>revoked=true};
+  s.context.setTimeout=callback=>{delayed=callback;};s.context.exportMissionHistory();
+  const exported=JSON.parse(await blob.text());assert.deepEqual(Object.fromEntries(exported.archiveRaw.map(({key,raw})=>[key,raw])),Object.fromEntries(originalEntries));
+  assert.equal(revoked,false);delayed();assert.equal(revoked,true);
+  s.context.confirm=message=>{confirmation=message;return false;};s.context.removeExportedMissionArchives();
+  assert.match(confirmation,/saved and opened/);assert.equal(archived(s).length,2);assert.equal(s.stored.get('mission'),active);
+  quota=false;s.context.archiveReconMission('after-export');quota=true;const later=archived(s).find(x=>x.reason==='after-export'),laterBytes=s.stored.get(later.key);
+  s.context.confirm=()=>true;s.context.removeExportedMissionArchives();
+  assert.equal(archived(s).length,1);assert.equal(s.stored.get(later.key),laterBytes);assert.equal(s.stored.get('mission'),active);
+  assert.equal(s.context.reconMission.candidates[0].id,'active');
+  s.context.reconMission.candidates[0].id='updated';s.context.saveReconMission();s.context.clearReconMission();
+  assert.equal(s.context.reconMission,null);assert.equal(archived(s).length,2);assert.equal(s.stored.has('mission'),false);
+});
+
+test('archive export trusts real storage keys and dates, and removal errors are distinct from save failures',()=>{
+  const s=setup([]);s.load();
+  const entry={version:1,mission:{id:'old'},reason:'fixture',archivedAt:'2020-01-01'};
+  s.stored.set(historyKey+'z',JSON.stringify({...entry,key:'mission'}));
+  s.stored.set(historyKey+'a',JSON.stringify({...entry,archivedAt:'2021-01-01'}));
+  const records=s.context.readMissionHistory().archived;assert.deepEqual(Array.from(records,x=>x.key),[historyKey+'z',historyKey+'a']);
+  s.context.exportMissionHistory();s.context.confirm=()=>true;s.context.localStorage.removeItem=()=>{throw Error('denied');};
+  s.context.removeExportedMissionArchives();assert.match(s.elements.get('missionStorageWarning').textContent,/Could not remove all exported archives/);
+  assert.equal(archived(s).length,2);assert.equal(s.saved().id,'mission-id');
+  installClear(s);s.context.clearReconMission();assert.match(s.elements.get('missionStorageWarning').textContent,/Could not remove the active mission/);
+});
+
+test('actual worker initial save failure stops before network and retains its pending cell for retry',async()=>{
+  const s=setup([lead('history',{manualReviewHistory:[{decision:{reason:'Keep'}}]})]);s.load();installWorker(s);
+  const before=s.stored.get('mission');let scans=0;s.context.RunEngine.scanZones=async()=>{scans++;return [];};
+  s.context.localStorage.setItem=()=>{throw Error('quota');};s.context.missionRunning=true;
+  await s.context.runMissionWorker('worker');
+  assert.equal(scans,0);assert.equal(s.requests.length,0);assert.equal(s.context.missionStopRequested,true);
+  assert.equal(s.context.missionRunning,true);assert.equal(s.context.reconMission.cells[0].status,'pending');
+  assert.equal(s.context.reconMission.cells[0].attempts,0);assert.equal(s.elements.get('missionPauseBtn').disabled,true);
+  assert.equal(s.stored.get('mission'),before);assert.equal(s.context.reconMission.candidates[0].manualReviewHistory[0].decision.reason,'Keep');
+});
+
+test('actual launched workers settle after save failure without overlapping replacement or throwing from finally',async()=>{
+  const s=setup([]);s.load();installClear(s);installLaunch(s);installWorker(s);s.elements.get('missionRadius').value=18;
+  const deferred=[];s.context.RunEngine.scanZones=()=>new Promise(resolve=>deferred.push(resolve));s.context.RunEngine.clusterZones=()=>[];
+  const launch=s.context.launchReconMission();assert.equal(deferred.length,2);const mission=s.context.reconMission,before=s.stored.get('mission');
+  const set=s.context.localStorage.setItem;s.context.localStorage.setItem=()=>{throw Error('quota while working');};
+  deferred[0]([]);await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(s.context.missionRunning,true);assert.equal(s.context.missionStopRequested,true);assert.equal(mission.status,'stopped');
+  assert.equal(s.elements.get('missionLandBtn').disabled,true);const archives=archived(s).length;
+  await s.context.launchReconMission();s.context.clearReconMission();
+  assert.equal(s.context.reconMission,mission);assert.equal(archived(s).length,archives);assert.equal(deferred.length,2);
+  deferred[1]([]);await launch;
+  assert.equal(s.context.missionRunning,false);assert.equal(s.elements.get('missionLaunchBtn').disabled,false);
+  assert.equal(s.elements.get('missionPauseBtn').disabled,true);assert.equal(s.elements.get('missionLandBtn').disabled,false);
+  assert.equal(s.stored.get('mission'),before);assert.equal(s.elements.get('missionStorageWarning').style.display,'block');
+  assert.equal(mission.cells.filter(c=>c.status==='rejected').length,2);
+  s.context.localStorage.setItem=set;assert.equal(s.context.saveReconMission(),true);
+  assert.equal(s.elements.get('missionStorageWarning').style.display,'none');assert.equal(s.saved().status,'stopped');
 });

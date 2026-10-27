@@ -243,8 +243,10 @@
     </div>
     <div style="margin-bottom:6px">
       <button class="btn" onclick="exportMissionHistory()" title="Download current and archived mission evidence and review history">Export History</button>
+      <button class="btn" onclick="removeExportedMissionArchives()" title="Remove only archived records included in your saved export">Remove exported archives</button>
     </div>
     <div style="font-size:8px;color:var(--dim);margin:-2px 0 6px">Japan uses smaller 4 km search cells. Zoom around Yotei and choose <b style="color:var(--red)">Reject View</b> to exclude that area permanently.</div>
+    <div id="missionStorageWarning" role="alert" style="display:none;color:#ffb46b;padding:8px 0"></div>
     <div id="missionPanel" style="display:none;margin-bottom:8px">
       <div class="mission-progress"><div id="missionProgressBar"></div></div>
       <div id="missionStatus" style="font-size:9px;color:var(--orange);margin:4px 0">Preparing…</div>
@@ -2154,6 +2156,8 @@ let missionParcelLayer = L.layerGroup().addTo(map);
 const missionParcelGeometry = new Map();
 const missionLandRequests = new WeakMap();
 let missionLandBatch = null;
+let missionActiveRaw = null;
+let missionExportedArchives = null;
 
 function escapeLandText(value) {
   return String(value == null ? '' : value).replace(/[&<>'"]/g, ch => ({
@@ -2436,8 +2440,31 @@ function missionDistanceM(a, b) {
 }
 
 function saveReconMission() {
-  if (!reconMission) return localStorage.removeItem(MISSION_KEY);
-  localStorage.setItem(MISSION_KEY, JSON.stringify(reconMission));
+  // Only explicit Clear removes ACTIVE. A failed or unreadable load must not
+  // turn a routine save into deletion of the original bytes.
+  if (!reconMission) return true;
+  try {
+    localStorage.setItem(MISSION_KEY, JSON.stringify(reconMission));
+    missionActiveRaw = null;
+    document.getElementById('missionStorageWarning').style.display = 'none';
+    return true;
+  } catch (_) {
+    missionStopRequested = true;
+    reconMission.status = 'stopped';
+    // Keep missionRunning true until actual workers settle; never permit a
+    // replacement while a pending result can still update this mission.
+    resetMissionLandBatch();
+    document.getElementById('missionPauseBtn').disabled = true;
+    showMissionStorageWarning('Changes are unsaved: browser storage could not save this mission. Results remain in memory and previously stored bytes are unchanged. Export History, open the saved file, then remove exported archives to free space and retry.');
+    return false;
+  }
+}
+
+function showMissionStorageWarning(message) {
+  const warning = document.getElementById('missionStorageWarning');
+  warning.textContent = message;
+  warning.style.display = 'block';
+  log(message, 'warn');
 }
 
 function readMissionHistory() {
@@ -2450,32 +2477,36 @@ function readMissionHistory() {
     if (raw == null) continue;
     try {
       const entry = JSON.parse(raw);
-      if (entry?.version !== 1 || !entry.mission || typeof entry.mission !== 'object'
+      const hasMission = entry?.mission && typeof entry.mission === 'object' && !Array.isArray(entry.mission);
+      if (entry?.version !== 1 || (!hasMission && typeof entry?.activeRaw !== 'string')
           || typeof entry.reason !== 'string' || typeof entry.archivedAt !== 'string') throw new Error('Unknown history format');
-      archived.push({ key, ...entry });
+      archived.push({ ...entry, key });
     } catch (_) { unreadable.push({ key, raw }); }
   }
+  archived.sort((a, b) => a.archivedAt.localeCompare(b.archivedAt) || a.key.localeCompare(b.key));
   return { archived, unreadable };
 }
 
 function showMissionHistoryError() {
-  const message = 'Could not save mission history; existing results are retained. Export history or free storage, then retry.';
+  const message = 'Could not save mission history; existing results are retained. Export History, open the saved file, then remove exported archives to free space and retry.';
   document.getElementById('missionPanel').style.display = 'block';
   document.getElementById('missionStatus').textContent = message;
-  log(message, 'warn');
+  showMissionStorageWarning(message);
 }
 
 function archiveReconMission(reason) {
-  if (!reconMission) return true;
   try {
-    const snapshot = JSON.stringify(reconMission);
-    // Separate immutable storage keys avoid rewriting an older archive or a
-    // shared index when another tab archives its own mission.
-    if (readMissionHistory().archived.some(entry => JSON.stringify(entry.mission) === snapshot)) return true;
+    const activeRaw = reconMission ? null : (missionActiveRaw ?? localStorage.getItem(MISSION_KEY));
+    if (!reconMission && activeRaw == null) return true;
+    const snapshot = reconMission ? JSON.stringify(reconMission) : null;
+    // Separate immutable keys retain old records, including unreadable ACTIVE.
+    if (readMissionHistory().archived.some(entry => snapshot !== null
+      ? JSON.stringify(entry.mission) === snapshot : entry.activeRaw === activeRaw)) return true;
     const suffix = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
     const key = MISSION_KEY + ':history:' + suffix;
     if (localStorage.getItem(key) != null) throw new Error('History key collision');
-    const raw = JSON.stringify({ version: 1, archivedAt: new Date().toISOString(), reason, mission: JSON.parse(snapshot) });
+    const raw = JSON.stringify({ version: 1, archivedAt: new Date().toISOString(), reason,
+      ...(snapshot !== null ? { mission: JSON.parse(snapshot) } : { activeRaw }) });
     localStorage.setItem(key, raw);
     if (localStorage.getItem(key) !== raw) throw new Error('History write was not retained');
     return true;
@@ -2483,25 +2514,62 @@ function archiveReconMission(reason) {
 }
 
 function missionHistoryExport() {
-  return { version: 1, exportedAt: new Date().toISOString(), ...readMissionHistory(),
-    active: reconMission ? JSON.parse(JSON.stringify(reconMission)) : null };
+  const history = readMissionHistory();
+  const archiveRaw = [...history.archived, ...history.unreadable]
+    .map(({ key }) => ({ key, raw: localStorage.getItem(key) }));
+  return { version: 1, exportedAt: new Date().toISOString(), ...history, archiveRaw,
+    active: reconMission ? JSON.parse(JSON.stringify(reconMission)) : null,
+    activeRaw: reconMission ? null : (missionActiveRaw ?? localStorage.getItem(MISSION_KEY) ?? null) };
 }
 
 function exportMissionHistory() {
   try {
-    const blob = new Blob([JSON.stringify(missionHistoryExport(), null, 2)], { type: 'application/json' });
+    const data = missionHistoryExport();
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a'); a.href = url; a.download = 'snowrecon-mission-history.json'; a.click();
-    URL.revokeObjectURL(url);
+    missionExportedArchives = data.archiveRaw;
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
   } catch (_) {
-    log('Mission history could not be exported; saved records are unchanged.', 'warn');
+    showMissionStorageWarning('Mission history could not be exported; saved records are unchanged.');
+  }
+}
+
+function removeExportedMissionArchives() {
+  if (!missionExportedArchives?.length) {
+    showMissionStorageWarning('Export History first, save and open the downloaded file, then remove exported archives.');
+    return;
+  }
+  if (!confirm('Have you saved and opened the exported history file? Remove only the archived records included in that export from this browser? The active mission stays here. Cancel if your export is not safely saved.')) return;
+  try {
+    // New or changed entries after export are never removed by this action.
+    for (const { key, raw } of missionExportedArchives) {
+      if (key.startsWith(MISSION_KEY + ':history:') && localStorage.getItem(key) === raw) localStorage.removeItem(key);
+    }
+    missionExportedArchives = null;
+    showMissionStorageWarning('Exported archives removed. The active mission and in-memory results are retained. Retry saving or resume the mission; keep your exported file.');
+  } catch (_) {
+    showMissionStorageWarning('Could not remove all exported archives. The active mission is unchanged; keep your export and retry archive removal.');
   }
 }
 
 function loadReconMission() {
   resetMissionLandBatch();
-  try { reconMission = JSON.parse(localStorage.getItem(MISSION_KEY) || 'null'); }
-  catch (_) { reconMission = null; }
+  const raw = localStorage.getItem(MISSION_KEY);
+  try {
+    const loaded = JSON.parse(raw || 'null');
+    const record = value => value && typeof value === 'object' && !Array.isArray(value);
+    if (loaded !== null && (!record(loaded) || !Array.isArray(loaded.cells) || !loaded.cells.every(record)
+        || !Array.isArray(loaded.candidates) || !loaded.candidates.every(c => record(c)
+          && Number.isFinite(c.lat) && Number.isFinite(c.lng) && (c.flags == null || Array.isArray(c.flags)))
+        || (loaded.exclusions != null && !Array.isArray(loaded.exclusions)))) throw new Error('Invalid mission shape');
+    reconMission = loaded;
+    missionActiveRaw = null;
+  } catch (_) {
+    reconMission = null;
+    missionActiveRaw = raw;
+    showMissionStorageWarning('Saved mission data could not be loaded. Original bytes are retained and included in Export History. Clear or a new mission must archive those bytes first.');
+  }
   if (reconMission) {
     reconMission.exclusions ||= [];
     // Browser refresh/crash recovery: work that was in-flight is safe to retry.
@@ -2547,7 +2615,7 @@ async function launchReconMission() {
     return;
   }
   if (!reconMission || reconMission.status === 'complete' || reconMission.cellKm !== cellKm) {
-    if (reconMission && !archiveReconMission('completed_replacement')) return;
+    if (!archiveReconMission('completed_replacement')) return;
     const priorExclusions = reconMission?.exclusions || [];
     resetMissionLandBatch();
     reconMission = {
@@ -2564,7 +2632,16 @@ async function launchReconMission() {
   document.getElementById('missionPanel').style.display = 'block';
   document.getElementById('missionPauseBtn').disabled = false;
   document.getElementById('missionLaunchBtn').disabled = true;
-  renderMissionCockpit(); saveReconMission();
+  renderMissionCockpit();
+  if (!saveReconMission()) {
+    missionRunning = false;
+    resetMissionLandBatch();
+    document.getElementById('missionLaunchBtn').disabled = false;
+    document.getElementById('missionLaunchBtn').textContent = 'Resume Mission';
+    document.getElementById('missionPauseBtn').disabled = true;
+    renderMissionCockpit();
+    return;
+  }
   await Promise.all([runMissionWorker('Alpine-1'), runMissionWorker('Alpine-2')]);
   if (!missionStopRequested && reconMission.cells.every(c => ['complete','rejected','error'].includes(c.status))) {
     reconMission.status = 'complete';
@@ -2584,7 +2661,12 @@ async function runMissionWorker(agentName) {
     if (!cell) return;
     cell.status = 'running'; cell.agent = agentName; cell.attempts++;
     reconMission.updatedAt = new Date().toISOString();
-    renderMissionCockpit(); saveReconMission();
+    renderMissionCockpit();
+    if (!saveReconMission()) {
+      cell.status = 'pending'; cell.agent = null; cell.attempts--;
+      renderMissionCockpit();
+      return;
+    }
     try {
       RunEngine.setZoneSensitivity(12, 180);
       // Keep sample spacing below the clustering radius. The first mission build
@@ -2692,7 +2774,9 @@ function clearReconMission() {
   }
   if (!archiveReconMission('clear')) return;
   try { localStorage.removeItem(MISSION_KEY); }
-  catch (_) { showMissionHistoryError(); return; }
+  catch (_) { showMissionStorageWarning('Could not remove the active mission. Its saved bytes and history are retained; retry Clear.'); return; }
+  missionActiveRaw = null;
+  document.getElementById('missionStorageWarning').style.display = 'none';
   resetMissionLandBatch();
   missionStopRequested = true; missionRunning = false; missionPaused = false;
   reconMission = null;

@@ -16,7 +16,7 @@ function setup() {
     prompt:()=>answers.shift(),alert:message=>{throw Error(message);},saveReconMission:()=>effects.saved++,drawMissionCandidates:()=>effects.drawn++});
   const escape=html.slice(html.indexOf('function escapeHtml('),html.indexOf('function applyMissionPreset('));
   const land=html.slice(html.indexOf('function escapeLandText('),html.indexOf('function publicNullableNumber('));
-  const handlers=html.slice(html.indexOf('function rejectCurrentMapArea('),html.indexOf('function drawMissionCandidates('));
+  const handlers=html.slice(html.indexOf('function findMissionExclusion('),html.indexOf('function drawMissionCandidates('));
   vm.runInContext(escape+land+handlers,context);
   function scan(lat=45.002,lng=-112.002,extra={}) {
     context.replaceMissionCandidateEvidence(candidate,{lat,lng,verdict:'advance',score:60,qualifyingSamples:5,flags:[],...extra});
@@ -95,6 +95,47 @@ test('new candidate decision within a current area does not inherit area provena
   assert.ok(!s.candidate.flags.includes('prior_area_rejection_retained'));
   assert.doesNotMatch(s.output(),/Rejection retained from an earlier location/);
 });
+
+test('a scan exclusion overriding a manual sideline retains explicit automated provenance after a move',()=>{
+  const s=setup();s.answers.push('Existing exclusion');s.context.rejectCurrentMapArea();
+  s.answers.push('Inspect current access');s.context.sidelineMissionCandidate(s.event,'lead');
+  const priorHistory=JSON.stringify(s.candidate.manualReviewHistory),priorReview=s.candidate.manualReview;
+  const incoming={lat:s.candidate.lat,lng:s.candidate.lng,verdict:'advance',score:70,flags:[]};
+  const exclusion=s.context.findMissionExclusion(incoming.lat,incoming.lng);
+  assert.ok(exclusion);s.context.applyMissionScanExclusion(incoming,exclusion);
+  s.scan(incoming.lat,incoming.lng,incoming);
+  assert.equal(s.candidate.verdict,'reject');assert.equal(s.candidate.rejectReason,'Existing exclusion');
+  assert.equal(s.candidate.manualReview.verdict,'reject');assert.equal(s.candidate.manualReview.reason,s.candidate.rejectReason);
+  assert.equal(s.candidate.manualReview.source,'scan_exclusion');assert.equal(s.candidate.manualReview.automated,true);
+  assert.equal(s.candidate.manualReview.exclusionId,exclusion.id);
+  assert.equal(s.candidate.manualReview.exclusionCreatedAt,exclusion.createdAt);
+  assert.equal(JSON.stringify(s.candidate.manualReviewHistory.slice(0,-1)),priorHistory);
+  const entry=s.candidate.manualReviewHistory.at(-1);
+  assert.equal(entry.before.verdict,'sideline');assert.equal(entry.before.manualReview.reason,'Inspect current access');
+  assert.equal(entry.decision.source,'scan_exclusion');assert.equal(entry.decision.automated,true);
+  priorReview.reason='later change';incoming.manualReview.reason='later incoming change';
+  assert.equal(entry.before.manualReview.reason,'Inspect current access');assert.equal(entry.decision.reason,'Existing exclusion');
+  assert.ok(s.candidate.flags.includes('inside_rejected_area'));
+  assert.doesNotMatch(s.output(),/Rejection retained from an earlier location/);
+  const history=JSON.stringify(s.candidate.manualReviewHistory);
+  s.scan(45.004,-112.004,{manualReviewHistory:[]});
+  assert.equal(s.context.findMissionExclusion(s.candidate.lat,s.candidate.lng),null);
+  assert.ok(s.candidate.flags.includes('prior_area_rejection_retained'));
+  assert.ok(!s.candidate.flags.includes('inside_rejected_area'));
+  assert.match(s.output(),/Rejection retained from an earlier location: Existing exclusion/);
+  assert.equal(s.candidate.manualReview.source,'scan_exclusion');assert.equal(s.candidate.manualReview.verdict,'reject');
+  assert.equal(JSON.stringify(s.candidate.manualReviewHistory),history);
+  assert.ok(html.includes('applyMissionScanExclusion(candidate, exclusion);'));
+});
+
+for(const stale of [{verdict:'sideline',reason:'Existing exclusion'},{verdict:'reject',reason:'Earlier candidate reason'}])
+  test(`stale candidate provenance cannot suppress retained-area wording (${stale.verdict}, ${stale.reason})`,()=>{
+    const s=setup();s.candidate.verdict='reject';s.candidate.rejectReason='Existing exclusion';
+    s.candidate.flags=['inside_rejected_area'];s.candidate.manualReview={source:'candidate',...stale};
+    s.scan(45.004,-112.004);
+    assert.ok(s.candidate.flags.includes('prior_area_rejection_retained'));
+    assert.match(s.output(),/Rejection retained from an earlier location: Existing exclusion/);
+  });
 
 test('prior decision snapshots are detached from later mutable review and flags',()=>{
   const s=setup(),oldReview=s.candidate.manualReview,oldFlags=s.candidate.flags;

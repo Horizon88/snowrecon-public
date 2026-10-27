@@ -66,7 +66,10 @@ test('an earlier manual promotion cannot override a fresh exclusion', () => {
   assert.equal(existing.verdict, 'reject');
   assert.equal(existing.rejectReason, 'inside exclusion');
   assert.equal(existing.rejectedAt, 'today');
-  assert.equal(existing.manualReview.decision, 'promote');
+  assert.equal(existing.manualReview.source, 'scan_exclusion');
+  assert.equal(existing.manualReview.automated, true);
+  assert.equal(existing.manualReview.verdict, 'reject');
+  assert.equal(existing.manualReviewHistory[0].before.manualReview.decision, 'promote');
 });
 
 test('replacement retains complete prior evidence without recursively nesting history', () => {

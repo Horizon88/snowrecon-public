@@ -2497,8 +2497,7 @@ async function runMissionWorker(agentName) {
         };
         const exclusion = findMissionExclusion(candidate.lat, candidate.lng);
         if (exclusion) {
-          candidate.verdict = 'reject'; candidate.rejectReason = exclusion.reason;
-          candidate.rejectedAt = new Date().toISOString(); candidate.flags.unshift('inside_rejected_area');
+          applyMissionScanExclusion(candidate, exclusion);
         } else if (candidate.verdict === 'watch') candidate.verdict = 'sideline';
         const dupe = reconMission.candidates.find(c => missionDistanceM(c, candidate) < 750);
         if (!dupe) {
@@ -2551,6 +2550,15 @@ function clearReconMission() {
 
 function findMissionExclusion(lat, lng) {
   return (reconMission?.exclusions || []).find(x => lat >= x.bounds.south && lat <= x.bounds.north && lng >= x.bounds.west && lng <= x.bounds.east) || null;
+}
+
+function applyMissionScanExclusion(candidate, exclusion) {
+  candidate.verdict = 'reject'; candidate.rejectReason = exclusion.reason;
+  candidate.rejectedAt = new Date().toISOString(); candidate.flags.unshift('inside_rejected_area');
+  // This applies an existing exclusion automatically; it is not a new user decision.
+  candidate.manualReview = { verdict: 'reject', reason: exclusion.reason, at: candidate.rejectedAt,
+    source: 'scan_exclusion', automated: true, position: { lat: candidate.lat, lng: candidate.lng },
+    exclusionId: exclusion.id, exclusionCreatedAt: exclusion.createdAt };
 }
 
 function rejectCurrentMapArea() {
@@ -2616,6 +2624,16 @@ function replaceMissionCandidateEvidence(existing, candidate) {
     ? candidate.terrainReviewStatus : 'unknown';
   Object.assign(existing, candidate, { id: existing.id, terrainReviewStatus, terrainReviewHistory: history }, savedReview);
   if (manualHistory) existing.manualReviewHistory = manualHistory;
+  if (!reviewed && candidate.verdict === 'reject' && candidate.flags?.includes('inside_rejected_area')) {
+    const before = { verdict: priorRecord.verdict, reason: priorRecord.rejectReason, rejectedAt: priorRecord.rejectedAt,
+      position: { lat: priorRecord.lat, lng: priorRecord.lng }, flags: priorRecord.flags, manualReview: priorRecord.manualReview };
+    const decision = { verdict: 'reject', reason: candidate.rejectReason, at: candidate.rejectedAt || new Date().toISOString(),
+      source: 'scan_exclusion', automated: true, position: { lat: candidate.lat, lng: candidate.lng },
+      ...(candidate.manualReview?.source === 'scan_exclusion' ? {
+        exclusionId: candidate.manualReview.exclusionId, exclusionCreatedAt: candidate.manualReview.exclusionCreatedAt } : {}) };
+    existing.manualReviewHistory = [...(manualHistory || []), JSON.parse(JSON.stringify({ before, decision }))];
+    existing.manualReview = decision;
+  }
   existing.flags = Array.isArray(existing.flags) ? [...existing.flags] : [];
   const positionChanged = existing.lat !== priorRecord.lat || existing.lng !== priorRecord.lng;
   if (positionChanged) {
@@ -2626,7 +2644,9 @@ function replaceMissionCandidateEvidence(existing, candidate) {
     if (!existing.flags.includes('parcel_status_unknown')) existing.flags.push('parcel_status_unknown');
   }
   if (savedReview.verdict === 'reject' && !existing.flags.includes('inside_rejected_area')) {
-    const currentManualDecision = priorRecord.manualReview?.source === 'candidate';
+    const currentManualDecision = priorRecord.manualReview?.source === 'candidate'
+      && priorRecord.manualReview.verdict === priorRecord.verdict
+      && priorRecord.manualReview.reason === priorRecord.rejectReason;
     const priorAreaRejection = !currentManualDecision && priorRecord.flags?.includes('inside_rejected_area');
     const retainedAreaRejection = !currentManualDecision && priorRecord.flags?.includes('prior_area_rejection_retained');
     const flag = priorAreaRejection && !positionChanged ? 'inside_rejected_area'

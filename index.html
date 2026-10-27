@@ -2343,19 +2343,22 @@ async function performMissionLandCheck(candidate, request, options) {
   }
   mission.candidates.sort(missionCandidateSort);
   saveReconMission();
-  if (!options.silent) { renderMissionCockpit(); drawMissionCandidates(); }
+  // A stopped mission retains current results, even when its bulk UI owner was cancelled.
+  if (!options.silent || mission.status === 'stopped') { renderMissionCockpit(); drawMissionCandidates(); }
   return candidate.landCheck;
 }
 
 function resetMissionLandBatch() {
   missionLandBatch = null;
   const button = document.getElementById('missionLandBtn');
-  button.disabled = false; button.textContent = 'Check Land';
+  const stopping = missionRunning && reconMission?.status === 'stopped';
+  button.disabled = stopping; button.textContent = stopping ? 'Stopping…' : 'Check Land';
 }
 
 async function checkMissionLand() {
   const mission = reconMission;
   if (!mission?.candidates?.length) { log('Run a Recon Mission first; land checks attach to ranked terrain leads.', 'warn'); return; }
+  if (missionRunning && mission.status === 'stopped') return;
   if (missionLandBatch?.mission === mission) return;
   const button = document.getElementById('missionLandBtn');
   const queue = mission.candidates.filter(c => !(c.landCheck?.status === 'matched' && firstMissionParcel(c.landCheck))).slice(0, 30);
@@ -2495,10 +2498,11 @@ async function launchReconMission() {
     reconMission.status = 'complete';
   }
   missionRunning = false;
+  if (!missionLandBatch) resetMissionLandBatch();
   document.getElementById('missionLaunchBtn').disabled = false;
   document.getElementById('missionLaunchBtn').textContent = reconMission.status === 'complete' ? 'Mission Complete' : 'Resume Mission';
   document.getElementById('missionPauseBtn').disabled = true;
-  saveReconMission(); renderMissionCockpit();
+  saveReconMission(); renderMissionCockpit(); drawMissionCandidates();
 }
 
 async function runMissionWorker(agentName) {
@@ -2606,14 +2610,15 @@ function toggleMissionPause() {
 }
 
 function clearReconMission() {
-  resetMissionLandBatch();
   if (missionRunning) {
     missionStopRequested = true;
     reconMission.status = 'stopped';
+    resetMissionLandBatch();
     document.getElementById('missionStatus').textContent = 'Stopping workers after current analysis…';
     saveReconMission();
     return;
   }
+  resetMissionLandBatch();
   missionStopRequested = true; missionRunning = false; missionPaused = false;
   reconMission = null; localStorage.removeItem(MISSION_KEY);
   missionLayer.clearLayers();
@@ -2799,6 +2804,7 @@ function renderMissionCockpit() {
   const purchaseLeads = reconMission.candidates.filter(c => currentMissionLandFit(c)?.landPath === 'purchase_lead').length;
   document.getElementById('missionStatus').textContent = reconMission.status === 'complete'
     ? `Complete · ${reconMission.name} · ${reconMission.candidates.length} terrain leads · ${purchaseLeads} private purchase leads`
+    : reconMission.status === 'stopped' ? (missionRunning ? 'Stopping workers after current analysis…' : 'Stopped · retained results saved locally')
     : missionPaused ? 'Paused · progress saved locally' : active || 'Workers preparing next cells…';
   const reports = document.getElementById('missionReports');
   reports.innerHTML = reconMission.candidates.slice(0, 30).map((c, i) => {

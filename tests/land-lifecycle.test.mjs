@@ -16,7 +16,7 @@ function setup(candidates,fetcher=()=>{throw Error('unexpected fetch');}) {
   const layer=()=>({clearLayers(){}});
   const shape=(type,args)=>{const record={type,args};shapes.push(record);return{
     bindPopup(popup){record.popup=popup;return this;},addTo(){return this;}};};
-  const context=vm.createContext({MISSION_KEY:'mission',reconMission:null,missionPaused:false,missionParcelGeometry:new Map(),missionLandRequests:new WeakMap(),missionLandBatch:null,
+  const context=vm.createContext({MISSION_KEY:'mission',reconMission:null,missionPaused:false,missionRunning:false,missionParcelGeometry:new Map(),missionLandRequests:new WeakMap(),missionLandBatch:null,
     document:{getElementById:id=>{if(!elements.has(id))elements.set(id,{style:{},innerHTML:'',textContent:''});return elements.get(id);}},
     localStorage:{getItem:key=>stored.get(key),setItem:(key,value)=>{stored.set(key,value);saves.push(JSON.parse(value));},removeItem:key=>stored.delete(key)},
     L:Object.fromEntries(['polygon','circle','circleMarker','geoJSON','rectangle'].map(type=>[type,(...args)=>shape(type,args)])),
@@ -285,5 +285,72 @@ test('Clear during an active mission cancels remaining bulk batches while retain
   deferred.forEach(resolve=>resolve(response('completed-before-stop')));await bulk;
   assert.equal(s.requests.length,3);assert.equal(s.saved().candidates.filter(c=>c.landCheck?.status==='matched').length,3);
   assert.equal(s.saved().candidates.find(c=>c.id==='stop-3').landCheck,undefined);
-  assert.ok(!s.logs.some(l=>l.message.includes('screening complete')));assert.equal(s.elements.get('missionLandBtn').disabled,false);
+  assert.ok(!s.logs.some(l=>l.message.includes('screening complete')));assert.equal(s.elements.get('missionLandBtn').disabled,true);
+});
+
+test('late silent results repaint the retained stopped mission after workers have exited',async()=>{
+  let finish;const c=lead('late',{landCheck:{status:'error',checkedAt:'prior-check',error:'retry',parcels:[]},landCheckHistory:[validLand('old')],manualReview:{reason:'Retain'},manualReviewHistory:[{decision:{reason:'Retain'}}]});
+  const s=setup([c],()=>new Promise(resolve=>finish=resolve));s.load();installClear(s);s.context.missionRunning=true;
+  const pending=s.context.checkMissionLand();
+  s.context.clearReconMission();s.context.missionRunning=false;s.context.renderMissionCockpit();
+  assert.match(s.output(),/Checking official parcels/);
+  finish({...response('late-current'),parcels:[{parcelId:'late-current',ownershipClass:'private',acres:40,geometry:{type:'Point',coordinates:[-112,45]}}]});
+  await pending;
+  assert.match(s.output(),/late-current/);assert.doesNotMatch(s.output(),/Checking official parcels/);
+  assert.ok(s.shapes.some(shape=>shape.type==='geoJSON'));
+  assert.match(s.elements.get('missionStatus').textContent,/Stopped/);
+  assert.deepEqual(s.saved().candidates[0].manualReview,c.manualReview);
+  assert.deepEqual(s.saved().candidates[0].manualReviewHistory,c.manualReviewHistory);
+  assert.deepEqual(s.saved().candidates[0].landCheckHistory[0],c.landCheckHistory[0]);
+  assert.deepEqual(s.saved().candidates[0].landCheckHistory[1],c.landCheck);
+});
+
+test('Clear keeps Check Land disabled and rejects bulk restart until workers stop',async()=>{
+  const deferred=[];const s=setup(Array.from({length:4},(_,i)=>lead('stopping-'+i,{lat:45+i/100})),()=>new Promise(resolve=>deferred.push(resolve)));
+  s.load();installClear(s);s.context.missionRunning=true;
+  const first=s.context.checkMissionLand();s.context.clearReconMission();
+  assert.equal(s.elements.get('missionLandBtn').disabled,true);
+  const restart=s.context.checkMissionLand();assert.equal(s.context.missionLandBatch,null);
+  assert.equal(s.requests.length,3);
+  deferred.forEach(resolve=>resolve(response('current')));await Promise.all([first,restart]);
+  assert.equal(s.requests.length,3);assert.equal(s.elements.get('missionLandBtn').disabled,true);
+  assert.match(s.elements.get('missionStatus').textContent,/Stopping/);
+});
+
+function installLaunch(s) {
+  Object.assign(s.context,{missionRunning:false,missionStopRequested:false,currentRegion:'usa',MISSION_PRESETS:{},map:{getCenter:()=>({lat:46,lng:-112})}});
+  s.elements.set('missionPreset',{value:'current'});s.elements.set('missionRadius',{value:6});s.elements.set('baseElevSlider',{value:100});
+  vm.runInContext(html.slice(html.indexOf('function missionCellGrid('),html.indexOf('function missionHash('))
+    +html.slice(html.indexOf('async function launchReconMission('),html.indexOf('async function runMissionWorker(')),s.context);
+  const workers=[];s.context.runMissionWorker=()=>new Promise(resolve=>workers.push(resolve));
+  return ()=>{s.context.reconMission.cells.forEach(cell=>cell.status='complete');workers.forEach(resolve=>resolve());};
+}
+
+test('actual launch replacement cancels old bulk ownership and isolates reused IDs and late results',async()=>{
+  const deferred=[];const s=setup(Array.from({length:4},(_,i)=>lead('replace-'+i,{lat:45+i/100})),()=>new Promise(resolve=>deferred.push(resolve)));
+  s.load();const oldMission=s.context.reconMission,exclusions=clone(oldMission.exclusions);
+  const oldBulk=s.context.checkMissionLand();assert.equal(s.requests.length,3);
+  const finishWorkers=installLaunch(s),launch=s.context.launchReconMission();
+  assert.notEqual(s.context.reconMission,oldMission);assert.equal(s.context.missionLandBatch,null);
+  assert.deepEqual(clone(s.context.reconMission.exclusions),exclusions);
+  const replacement=s.context.reconMission;replacement.candidates=[lead('replace-0',{lat:46})];
+  const freshBulk=s.context.checkMissionLand(),newOperation=s.context.missionLandBatch;
+  assert.equal(s.requests.length,4);assert.equal(s.requests[3].lat,46);
+  const saves=s.saves.length,output=s.output();deferred.slice(0,3).forEach(resolve=>resolve(response('obsolete')));await oldBulk;
+  assert.equal(s.saves.length,saves);assert.equal(s.output(),output);assert.equal(s.context.missionLandBatch,newOperation);
+  assert.equal(s.elements.get('missionLandBtn').disabled,true);assert.equal(s.requests.length,4);
+  deferred[3](response('replacement-result'));await freshBulk;finishWorkers();await launch;
+  assert.equal(s.saved().id,replacement.id);assert.equal(s.saved().candidates[0].landCheck.parcels[0].parcelId,'replacement-result');
+  assert.ok(!JSON.stringify(s.saved()).includes('obsolete'));assert.equal(s.context.missionRunning,false);
+  assert.equal(s.elements.get('missionLandBtn').disabled,false);
+});
+
+test('actual launch exit releases stopping controls and labels retained results as stopped',async()=>{
+  const s=setup([]);s.load();installClear(s);const finishWorkers=installLaunch(s);
+  const launch=s.context.launchReconMission();s.context.clearReconMission();
+  assert.equal(s.elements.get('missionLandBtn').disabled,true);
+  finishWorkers();await launch;
+  assert.equal(s.context.missionRunning,false);assert.equal(s.context.reconMission.status,'stopped');
+  assert.equal(s.elements.get('missionLandBtn').disabled,false);
+  assert.match(s.elements.get('missionStatus').textContent,/Stopped/);
 });

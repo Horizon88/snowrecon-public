@@ -13,3 +13,7 @@ North American Recon Mission candidates can be matched to official parcel data w
 - Approximate candidate footprints are not legal parcel boundaries.
 - Road presence does not establish legal or winter access.
 - Verify parcels, title, easements, protected status, terrain, and access with authoritative local sources and qualified professionals.
+
+## Evidence labels
+
+Recon mission cards describe the stored qualifying sample count, terrain completeness and modeled cat-route status. A modeled route does not establish legal access. Fixed confidence percentages are no longer generated or displayed; legacy confidence fields remain untouched in saved records and JSON exports. Missing completeness information on older records is shown as unknown.

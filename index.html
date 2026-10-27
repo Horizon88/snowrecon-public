@@ -2615,12 +2615,33 @@ function replaceMissionCandidateEvidence(existing, candidate) {
       : priorAreaRejection || retainedAreaRejection ? 'prior_area_rejection_retained' : null;
     if (flag && !existing.flags.includes(flag)) existing.flags.unshift(flag);
   }
+  refreshMissionLandFit(existing);
   if (existing.landCheck?.status === 'matched') {
-    existing.flags = existing.flags.filter(flag => flag !== 'parcel_status_unknown');
+    existing.flags = existing.flags.filter(flag => flag !== 'parcel_status_unknown' && flag !== 'public_land_requires_permission');
     if (existing.landCheck.landPath === 'permit_path' && !existing.flags.includes('public_land_requires_permission'))
       existing.flags.push('public_land_requires_permission');
   }
   return existing;
+}
+
+// Re-score existing source facts against the latest terrain without redating the source.
+function refreshMissionLandFit(candidate) {
+  const land = candidate.landCheck;
+  if (!land || !Number.isFinite(candidate.score)) return;
+  if (land.status === 'matched' && Array.isArray(land.parcels) && land.parcels.length) {
+    Object.assign(land, scoreLandFit(candidate, land), { fitUpdatedAt: new Date().toISOString() });
+  } else if (['no_parcel_at_point', 'unsupported_jurisdiction', 'error'].includes(land.status)) {
+    land.combinedScore = Math.round(candidate.score * .75);
+    land.fitUpdatedAt = new Date().toISOString();
+  }
+}
+
+function missionReviewSummary(candidate) {
+  const retained = candidate.verdict === 'reject'
+    && candidate.flags?.includes('prior_area_rejection_retained')
+    && !candidate.flags.includes('inside_rejected_area');
+  if (retained) return 'Rejection retained from an earlier location' + (candidate.rejectReason ? ': ' + candidate.rejectReason : '.');
+  return candidate.rejectReason || '';
 }
 
 // Describe stored evidence without assigning an uncalibrated probability.
@@ -2670,7 +2691,7 @@ function renderMissionCockpit() {
     return `<div class="mission-card" onclick="map.flyTo([${c.lat},${c.lng}],13)">
       <div style="display:flex;align-items:center;gap:5px"><b style="font-size:10px;color:#fff">#${i+1} ${c.lat.toFixed(4)}, ${c.lng.toFixed(4)}</b><span style="flex:1"></span><span class="mission-badge" style="color:${c.verdict==='advance'?'var(--green)':c.verdict==='reject'?'var(--red)':'var(--orange)'}">${c.verdict}</span>${score}</div>
       <div class="run-metrics"><span class="run-metric" style="color:var(--green)">${c.verticalM}m vert</span><span class="run-metric" style="color:var(--cyan)">${c.clusterSpanM}m cluster span*</span><span class="run-metric" style="color:var(--accent)">${c.aspect}</span><span class="run-metric" style="color:var(--orange)">${c.catAccess ? 'Access '+(c.catAccess.grade||'?')+' · '+c.catAccess.distanceKm+'km / '+c.catAccess.maxSlopeDeg+'°' : 'Access U · unverified'}</span></div>
-      ${legal}${c.rejectReason ? `<div style="font-size:8px;color:${c.verdict==='reject'?'var(--red)':'var(--orange)'};margin-top:4px">${escapeHtml(c.rejectReason)}</div>` : ''}<div style="font-size:10px;line-height:1.5;color:var(--dim);margin-top:5px">${escapeHtml(missionEvidenceSummary(c))}</div><div style="display:flex;align-items:center;gap:4px;margin-top:5px"><span style="font-size:8px;color:var(--dim);flex:1">${c.agent} · ${c.flags.length} open checks</span><button class="btn" onclick="event.stopPropagation();checkMissionCandidateLand('${c.id}')" style="font-size:8px;color:var(--cyan)">${land ? 'Recheck land' : 'Check land'}</button><button class="btn" onclick="sidelineMissionCandidate(event,'${c.id}')" style="font-size:8px;color:var(--orange)">Sideline</button><button class="btn" onclick="rejectMissionCandidate(event,'${c.id}')" style="font-size:8px;color:var(--red)">Reject</button></div></div>`;
+      ${legal}${missionReviewSummary(c) ? `<div style="font-size:11px;line-height:1.5;color:${c.verdict==='reject'?'var(--red)':'var(--orange)'};margin-top:4px">${escapeHtml(missionReviewSummary(c))}</div>` : ''}<div style="font-size:10px;line-height:1.5;color:var(--dim);margin-top:5px">${escapeHtml(missionEvidenceSummary(c))}</div><div style="display:flex;align-items:center;gap:4px;margin-top:5px"><span style="font-size:8px;color:var(--dim);flex:1">${c.agent} · ${c.flags.length} open checks</span><button class="btn" onclick="event.stopPropagation();checkMissionCandidateLand('${c.id}')" style="font-size:8px;color:var(--cyan)">${land ? 'Recheck land' : 'Check land'}</button><button class="btn" onclick="sidelineMissionCandidate(event,'${c.id}')" style="font-size:8px;color:var(--orange)">Sideline</button><button class="btn" onclick="rejectMissionCandidate(event,'${c.id}')" style="font-size:8px;color:var(--red)">Reject</button></div></div>`;
   }).join('') || '<div style="font-size:9px;color:var(--dim);padding:6px">No leads yet. Workers report here as cells finish.</div>';
 }
 

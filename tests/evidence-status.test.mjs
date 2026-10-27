@@ -8,7 +8,7 @@ const start = html.indexOf('function replaceMissionCandidateEvidence(');
 const end = html.indexOf('\nfunction renderMissionCockpit()', start);
 assert.ok(start >= 0 && end > start);
 const context = vm.createContext({missionParcelGeometry: new Map()});
-vm.runInContext(html.slice(start, end), context);
+vm.runInContext(html.slice(html.indexOf('function scoreLandFit('), html.indexOf('function missionCandidateSort(')) + html.slice(start, end), context);
 const summarize = context.missionEvidenceSummary;
 const replaceEvidence = context.replaceMissionCandidateEvidence;
 

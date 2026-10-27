@@ -9,7 +9,6 @@ function setup(candidate) {
   const mission = {candidates: [candidate]};
   const context = vm.createContext({reconMission: mission, missionParcelGeometry: new Map(),
     fetchOfficialLandParcels: (lat, lng) => new Promise((resolve, reject) => requests.push({lat, lng, resolve, reject})),
-    scoreLandFit: c => ({landPath: 'permit_path', score25: 5, combinedScore: c.score}),
     missionCandidateSort: () => 0, saveReconMission: () => effects.saved++,
     renderMissionCockpit: () => effects.rendered++, drawMissionCandidates: () => effects.drawn++});
   const a = html.indexOf('async function checkMissionCandidateLand(');
@@ -17,7 +16,7 @@ function setup(candidate) {
   const c = html.indexOf('function replaceMissionCandidateEvidence(');
   const d = html.indexOf('\nfunction renderMissionCockpit()', c);
   assert.ok(a >= 0 && b > a && c >= 0 && d > c);
-  vm.runInContext(html.slice(a, b) + '\n' + html.slice(c, d), context);
+  vm.runInContext(html.slice(html.indexOf('function scoreLandFit('), html.indexOf('function missionCandidateSort(')) + html.slice(a, b) + '\n' + html.slice(c, d), context);
   return {context, requests, effects, mission, check: context.checkMissionCandidateLand,
     replace: context.replaceMissionCandidateEvidence};
 }

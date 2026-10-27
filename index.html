@@ -2160,6 +2160,7 @@ function landCheckLabel(candidate) {
   const land = candidate.landCheck;
   if (!land) return 'Land unchecked';
   if (land.status === 'checking') return 'Checking official parcels…';
+  if (land.status === 'interrupted') return 'Land check interrupted · retry needed';
   if (land.status === 'unsupported_jurisdiction') return 'Parcel adapter not connected here';
   if (land.status === 'no_parcel_at_point') return 'No mapped parcel at candidate center';
   if (land.status === 'error') return `Land check error: ${land.error || 'retry'}`;
@@ -2200,6 +2201,7 @@ function firstMissionParcel(land) {
 // Keep old source/fit fields intact, but never use that incomplete fit as current evidence.
 function currentMissionLandFit(candidate) {
   const land = candidate.landCheck;
+  if (land?.status === 'checking' || land?.status === 'interrupted') return null;
   return land?.status === 'matched' && !firstMissionParcel(land) ? null : land;
 }
 
@@ -2403,6 +2405,15 @@ function loadReconMission() {
     reconMission.cells.forEach(c => { if (c.status === 'running') { c.status = 'pending'; c.agent = null; } });
     if (reconMission.status === 'running') reconMission.status = 'paused';
     reconMission.candidates.forEach(c => {
+      if (c.landCheck?.status === 'checking') {
+        // The old request cannot continue after reload. Retain it as a detached
+        // request record, not a completed source result, and wait for explicit retry.
+        const interruptedRequest = JSON.parse(JSON.stringify(c.landCheck));
+        c.landCheck = { ...c.landCheck, status: 'interrupted', interruptedRequest };
+        missionParcelGeometry.delete(c.id);
+        c.flags = (c.flags || []).filter(flag => flag !== 'public_land_requires_permission');
+        if (!c.flags.includes('parcel_status_unknown')) c.flags.push('parcel_status_unknown');
+      }
       if (!c.catAccess || c.catAccess.grade) return;
       const d = c.catAccess.distanceKm * 1000, s = c.catAccess.maxSlopeDeg;
       c.catAccess.grade = d <= 2000 && s <= 18 ? 'A' : d <= 4000 && s <= 20 ? 'B' : d <= 7000 && s <= 24 ? 'C' : 'F';
@@ -2784,7 +2795,7 @@ function drawMissionCandidates() {
     L.circleMarker([c.lat, c.lng], { radius: 6, color, weight: 2, fillColor: color, fillOpacity: .35 })
       .bindPopup(`<b>Recon lead #${i+1}</b><br>${c.verticalM}m vert · ${c.aspect}<br>${c.catAccess ? 'Access '+(c.catAccess.grade||'?')+' · '+c.catAccess.distanceKm+'km cat route' : 'Access U · unverified'}<br><small>${c.flags.length} open checks</small>`)
       .addTo(missionLayer);
-    const parcel = firstMissionParcel(c.landCheck);
+    const parcel = c.landCheck?.status === 'matched' ? firstMissionParcel(c.landCheck) : null;
     const geometries = parcel ? missionParcelGeometry.get(c.id) || [] : [];
     geometries.forEach(geometry => {
       const fill = parcel.ownershipClass === 'private' ? '#06b6d4' : parcel.ownershipClass === 'public' ? '#ef4444' : '#94a3b8';

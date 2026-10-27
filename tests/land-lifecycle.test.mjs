@@ -111,3 +111,67 @@ test('actual parcel popups handle malformed acreage and suppress geometry withou
   s.context.missionParcelGeometry.set('invalid',[{type:'Point',coordinates:[-112,45]}]);
   s.context.drawMissionCandidates();assert.ok(!s.shapes.some(p=>p.type==='geoJSON'));
 });
+
+test('load recovers interrupted land requests once without fetching or changing source/review history',()=>{
+  const pending={status:'checking',checkedAt:'exact-pending-time',queryPosition:{lat:45,lng:-112},
+    combinedScore:999,landPath:'purchase_lead',parcels:[{parcelId:'stale'}],customRequest:'preserve'};
+  const original=lead('pending',{landCheck:pending,flags:['public_land_requires_permission'],
+    landCheckHistory:[validLand('prior')],manualReview:{source:'candidate',verdict:'sideline',reason:'Keep for research'},
+    manualReviewHistory:[{decision:{reason:'Keep for research'}}],terrainReviewHistory:[{score:50}]});
+  const complete=lead('complete',{lat:45.01,landCheck:validLand('complete')});
+  const s=setup([original,complete]);s.context.missionParcelGeometry.set('pending',[{type:'Point',coordinates:[-112,45]}]);
+  s.load();
+  const restored=s.saved().candidates.find(c=>c.id==='pending');
+  assert.equal(restored.landCheck.status,'interrupted');
+  assert.equal(restored.landCheck.checkedAt,pending.checkedAt);assert.deepEqual(restored.landCheck.queryPosition,pending.queryPosition);
+  assert.deepEqual(restored.landCheck.interruptedRequest,pending);
+  assert.deepEqual(restored.landCheckHistory,original.landCheckHistory);
+  assert.deepEqual(restored.manualReview,original.manualReview);assert.deepEqual(restored.manualReviewHistory,original.manualReviewHistory);
+  assert.deepEqual(restored.terrainReviewHistory,original.terrainReviewHistory);
+  assert.deepEqual(s.saved().candidates.find(c=>c.id==='complete'),complete);
+  assert.ok(restored.flags.includes('parcel_status_unknown'));assert.ok(!restored.flags.includes('public_land_requires_permission'));
+  assert.equal(s.requests.length,0);assert.equal(s.context.missionParcelGeometry.has('pending'),false);
+  assert.equal(s.saved().candidates[0].id,'complete');assert.equal(s.context.currentMissionLandFit(restored),null);
+  assert.match(s.output(),/Land check interrupted · retry needed/);assert.doesNotMatch(s.output(),/Checking official parcels|FIT 999|Land check error|No mapped parcel/);
+  const once=s.stored.get('mission');s.load();assert.equal(s.stored.get('mission'),once);
+  const current=s.context.reconMission.candidates.find(c=>c.id==='pending');
+  current.landCheck.queryPosition.lat=90;assert.equal(current.landCheck.interruptedRequest.queryPosition.lat,45);
+});
+
+test('active checking markers never contribute stale FIT or purchase rank before recovery',()=>{
+  const c=lead('pending',{landCheck:{status:'checking',combinedScore:999,landPath:'purchase_lead',parcels:[{parcelId:'stale'}]}});
+  const s=setup([c]);s.context.reconMission=clone(s.saved());
+  s.context.renderMissionCockpit();
+  assert.equal(s.context.currentMissionLandFit(c),null);assert.doesNotMatch(s.output(),/FIT 999/);
+  assert.match(s.elements.get('missionStatus').textContent,/0 private purchase leads/);
+  const stronger=lead('stronger',{score:90});
+  assert.equal([c,stronger].sort(s.context.missionCandidateSort)[0].id,'stronger');
+});
+
+for(const oldFails of [false,true]) test(`explicit bulk retry after reload ignores late old ${oldFails?'failure':'success'} and retains history`,async()=>{
+  const deferred=[];
+  const c=lead('retry',{verdict:'reject',rejectReason:'Manual rejection',landCheck:validLand('old-source'),
+    manualReview:{source:'candidate',verdict:'reject',reason:'Manual rejection'},manualReviewHistory:[{decision:{reason:'Manual rejection'}}]});
+  const s=setup([c],()=>new Promise((resolve,reject)=>deferred.push({resolve,reject})));
+  s.load();const old=s.context.checkMissionCandidateLand('retry',{silent:true});
+  s.context.saveReconMission();const originalPending=clone(s.saved().candidates[0].landCheck);
+  s.load();assert.equal(s.requests.length,1);
+  assert.equal(s.saved().candidates[0].landCheck.status,'interrupted');
+  const retry=s.context.checkMissionLand(),current=s.context.reconMission.candidates[0],retryMarker=current.landCheck;
+  assert.equal(s.requests.length,2);assert.equal(retryMarker.status,'checking');
+  const persistedBeforeLate=s.stored.get('mission'),savesBeforeLate=s.saves.length;
+  if(oldFails)deferred[0].reject(new Error('late network failure'));
+  else deferred[0].resolve({supported:true,status:'matched',checkedAt:'late',parcels:[{parcelId:'stale-response'}]});
+  assert.equal(await old,null);assert.equal(current.landCheck,retryMarker);
+  assert.equal(s.stored.get('mission'),persistedBeforeLate);assert.equal(s.saves.length,savesBeforeLate);
+  deferred[1].resolve({supported:true,status:'matched',checkedAt:'new-source-time',parcels:[{parcelId:'fresh',ownershipClass:'private',acres:40}]});
+  await retry;
+  const saved=s.saved().candidates[0];
+  assert.equal(saved.landCheck.parcels[0].parcelId,'fresh');assert.equal(saved.landCheck.checkedAt,'new-source-time');
+  assert.equal(saved.landCheckHistory[0].parcels[0].parcelId,'old-source');
+  assert.equal(saved.landCheckHistory[1].status,'interrupted');assert.deepEqual(saved.landCheckHistory[1].interruptedRequest,originalPending);
+  assert.deepEqual(saved.manualReview,c.manualReview);assert.deepEqual(saved.manualReviewHistory,c.manualReviewHistory);
+  assert.equal(saved.verdict,'reject');assert.equal(saved.rejectReason,'Manual rejection');
+  assert.equal(s.elements.get('missionLandBtn').disabled,false);
+  assert.match(s.logs.at(-1).message,/1 candidate centers matched to mapped parcels/);
+});

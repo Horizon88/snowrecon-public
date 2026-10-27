@@ -383,7 +383,7 @@
   </div>
 </div>
 
-<script src="run-engine.js?v=20260820b"></script>
+<script src="run-engine.js?v=20261027a"></script>
 <script>
 // ===== DEBUG =====
 function log(msg, cls='') {
@@ -2031,10 +2031,11 @@ async function terrainZoneScan() {
   const minElevation = +document.getElementById('baseElevSlider').value;
   btn.textContent = 'Scanning terrain…';
   try {
-    const heatPoints = await RunEngine.scanZones(b, gridSize, (done, total, phase) => {
+    const scan = await RunEngine.scanZones(b, gridSize, (done, total, phase) => {
       status.textContent = `${phase}: ${done}/${total}`;
     }, { minElevation });
 
+    const heatPoints = scan.samples;
     status.textContent = `Clustering ${heatPoints.length} skiable samples…`;
     zones = RunEngine.clusterZones(heatPoints, sensitivity === 1 ? 900 : sensitivity === 2 ? 700 : 520);
     let roads = [];
@@ -2075,7 +2076,8 @@ async function terrainZoneScan() {
     document.getElementById('zoneSortBar').style.display = 'none';
     status.textContent = zones.length
       ? `Found ${zones.length} terrain candidates. Parcel coverage has not been checked.`
-      : 'No candidates at these settings. Lower minimum elevation or sensitivity, or resize the corridor.';
+      : 'No sampled candidates at these settings.';
+    if (!scan.coverage.complete) status.textContent += ' Elevation or bounded descent coverage is incomplete; further data review is needed.';
     log(`Terrain scan: ${heatPoints.length} qualifying samples → ${zones.length} cat-site candidates`, zones.length ? 'ok' : 'warn');
   } catch (error) {
     status.textContent = 'Terrain scan failed: ' + error.message;
@@ -2401,7 +2403,7 @@ async function launchReconMission() {
   document.getElementById('missionLaunchBtn').disabled = true;
   renderMissionCockpit(); saveReconMission();
   await Promise.all([runMissionWorker('Alpine-1'), runMissionWorker('Alpine-2')]);
-  if (!missionStopRequested && reconMission.cells.every(c => ['complete','rejected','error'].includes(c.status))) {
+  if (!missionStopRequested && reconMission.cells.every(c => ['complete','rejected','error','data_review'].includes(c.status))) {
     reconMission.status = 'complete';
   }
   missionRunning = false;
@@ -2425,13 +2427,16 @@ async function runMissionWorker(agentName) {
       // used 14 samples across 12 km (~850m) with a 650m radius, guaranteeing
       // isolated hits and false zero-result cells.
       const japanFine = currentRegion === 'japan';
-      const samples = await RunEngine.scanZones(cell.bounds, japanFine ? 20 : 18, null, { minElevation: reconMission.minElevation });
-      let local = RunEngine.clusterZones(samples, japanFine ? 450 : 900)
-        .filter(z => z.maxVert >= 250 && z.width >= 200)
-        .sort((a, b) => b.maxVert - a.maxVert || b.pointCount - a.pointCount);
+      const scan = await RunEngine.scanZones(cell.bounds, japanFine ? 20 : 18, null,
+        { minElevation: reconMission.minElevation, minVerticalDrop: 150 });
+      const screened = RunEngine.screenMissionZones(RunEngine.clusterZones(scan.samples, japanFine ? 450 : 900), scan.coverage);
+      const local = screened.zones;
+      cell.coverage = scan.coverage;
+      cell.reviewReason = screened.status === 'data_review' ? screened.reason : null;
+      cell.rejectReason = screened.status === 'rejected' ? screened.reason : null;
       if (!local.length) {
-        cell.status = 'rejected'; cell.rejectReason = samples.length ? 'No candidate passed 250m vertical / 200m span' : 'No qualifying terrain samples';
-        reconMission.rejected++;
+        cell.status = screened.status;
+        if (cell.status === 'rejected') reconMission.rejected++;
         continue;
       }
 
@@ -2471,13 +2476,14 @@ async function runMissionWorker(agentName) {
           verdict: zone.maxVert >= 350 && route ? 'advance' : 'watch',
           score: missionScore, confidence: route ? 0.58 : 0.35,
           verticalM: Math.round(zone.maxVert), clusterSpanM: zone.width,
+          preferredVertical: zone.preferredVertical, terrainReviewStatus: screened.status,
           aspect: zone.aspectDir, elevationMinM: Math.round(zone.minElev), elevationMaxM: Math.round(zone.maxElev),
           qualifyingSamples: zone.pointCount,
           footprint: zone.points.map(p => [p.lat, p.lng]),
           catAccess: route ? { distanceKm: +(route.distance/1000).toFixed(2), maxSlopeDeg: +route.maxSlope.toFixed(1),
             elevationGainM: Math.round(route.elevGain), grade: accessGrade, score25: Math.round(accessPts), roadType: route.roadType,
             roadAccess: route.roadAccess, roadSurface: route.roadSurface } : null,
-          flags: [routeFlag, 'skiable_acreage_unknown', 'usable_width_unknown', 'canopy_unknown',
+          flags: [routeFlag, !scan.coverage.complete && 'terrain_coverage_incomplete', 'skiable_acreage_unknown', 'usable_width_unknown', 'canopy_unknown',
             'snow_preservation_unknown', 'avalanche_scenarios_unknown', 'parcel_status_unknown', 'legal_access_unverified'].filter(Boolean),
         };
         const exclusion = findMissionExclusion(candidate.lat, candidate.lng);
@@ -2496,7 +2502,7 @@ async function runMissionWorker(agentName) {
       }
       await Promise.all(autoLandChecks.map(id => checkMissionCandidateLand(id, { silent: true })));
       cell.leads = local.length;
-      cell.status = 'complete';
+      cell.status = screened.status;
     } catch (error) {
       cell.status = cell.attempts < 2 ? 'pending' : 'error';
       cell.rejectReason = error.message; reconMission.errors++;
@@ -2571,7 +2577,7 @@ function sidelineMissionCandidate(event, id) {
 
 function renderMissionCockpit() {
   if (!reconMission) return;
-  const terminal = reconMission.cells.filter(c => ['complete','rejected','error'].includes(c.status)).length;
+  const terminal = reconMission.cells.filter(c => ['complete','rejected','error','data_review'].includes(c.status)).length;
   const total = reconMission.cells.length;
   document.getElementById('missionProgressBar').style.width = `${total ? terminal/total*100 : 0}%`;
   document.getElementById('missionCells').textContent = `${terminal}/${total}`;
@@ -2581,9 +2587,10 @@ function renderMissionCockpit() {
   document.getElementById('missionRejected').textContent = reconMission.rejected + rejectedCandidates;
   document.getElementById('missionErrors').textContent = reconMission.errors;
   const active = reconMission.cells.filter(c => c.status === 'running').map(c => `${c.agent}: ${c.id}`).join(' · ');
+  const dataReview = reconMission.cells.filter(c => c.status === 'data_review').length;
   const purchaseLeads = reconMission.candidates.filter(c => c.landCheck?.landPath === 'purchase_lead').length;
   document.getElementById('missionStatus').textContent = reconMission.status === 'complete'
-    ? `Complete · ${reconMission.name} · ${reconMission.candidates.length} terrain leads · ${purchaseLeads} private purchase leads`
+    ? `Complete · ${reconMission.name} · ${reconMission.candidates.length} terrain leads · ${purchaseLeads} private purchase leads · ${dataReview} cells need data review`
     : missionPaused ? 'Paused · progress saved locally' : active || 'Workers preparing next cells…';
   const reports = document.getElementById('missionReports');
   reports.innerHTML = reconMission.candidates.slice(0, 30).map((c, i) => {
@@ -2598,7 +2605,7 @@ function renderMissionCockpit() {
     const score = land?.combinedScore == null ? `<span class="badge b-purple" title="Terrain and verified physical access score">${c.score}</span>` : `<span class="badge b-purple" title="Terrain + physical access + parcel screening">FIT ${land.combinedScore}</span>`;
     return `<div class="mission-card" onclick="map.flyTo([${c.lat},${c.lng}],13)">
       <div style="display:flex;align-items:center;gap:5px"><b style="font-size:10px;color:#fff">#${i+1} ${c.lat.toFixed(4)}, ${c.lng.toFixed(4)}</b><span style="flex:1"></span><span class="mission-badge" style="color:${c.verdict==='advance'?'var(--green)':c.verdict==='reject'?'var(--red)':'var(--orange)'}">${c.verdict}</span>${score}</div>
-      <div class="run-metrics"><span class="run-metric" style="color:var(--green)">${c.verticalM}m vert</span><span class="run-metric" style="color:var(--cyan)">${c.clusterSpanM}m cluster span*</span><span class="run-metric" style="color:var(--accent)">${c.aspect}</span><span class="run-metric" style="color:var(--orange)">${c.catAccess ? 'Access '+(c.catAccess.grade||'?')+' · '+c.catAccess.distanceKm+'km / '+c.catAccess.maxSlopeDeg+'°' : 'Access U · unverified'}</span></div>
+      <div class="run-metrics"><span class="run-metric" style="color:var(--green)">${c.verticalM}m vert${c.preferredVertical ? " · preferred" : ""}</span><span class="run-metric" style="color:var(--cyan)">${c.clusterSpanM}m cluster span*</span><span class="run-metric" style="color:var(--accent)">${c.aspect}</span><span class="run-metric" style="color:var(--orange)">${c.catAccess ? 'Access '+(c.catAccess.grade||'?')+' · '+c.catAccess.distanceKm+'km / '+c.catAccess.maxSlopeDeg+'°' : 'Access U · unverified'}</span></div>
       ${legal}${c.rejectReason ? `<div style="font-size:8px;color:${c.verdict==='reject'?'var(--red)':'var(--orange)'};margin-top:4px">${escapeHtml(c.rejectReason)}</div>` : ''}<div style="display:flex;align-items:center;gap:4px;margin-top:5px"><span style="font-size:8px;color:var(--dim);flex:1">Confidence ${Math.round(c.confidence*100)}% · ${c.agent} · ${c.flags.length} open checks</span><button class="btn" onclick="event.stopPropagation();checkMissionCandidateLand('${c.id}')" style="font-size:8px;color:var(--cyan)">${land ? 'Recheck land' : 'Check land'}</button><button class="btn" onclick="sidelineMissionCandidate(event,'${c.id}')" style="font-size:8px;color:var(--orange)">Sideline</button><button class="btn" onclick="rejectMissionCandidate(event,'${c.id}')" style="font-size:8px;color:var(--red)">Reject</button></div></div>`;
   }).join('') || '<div style="font-size:9px;color:var(--dim);padding:6px">No leads yet. Workers report here as cells finish.</div>';
 }

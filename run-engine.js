@@ -21,7 +21,7 @@ const RunEngine = (() => {
   function getRegion() { return region; }
 
   function parseDEMText(text) {
-    const arr = new Float32Array(256 * 256);
+    const arr = new Float32Array(256 * 256).fill(NaN);
     const lines = text.trim().split('\n');
     for (let r = 0; r < Math.min(lines.length, 256); r++) {
       const cols = lines[r].split(',');
@@ -1026,7 +1026,8 @@ out body geom;`;
   // ===== ZONE SCANNER (sustained vertical heatmap) =====
   // For each grid point, walk downhill and measure how much vertical
   // you can descend while the terrain stays steep (>= slopeThreshold).
-  // Returns an array of {lat, lng, sustainedVert, aspect, elevation} objects.
+  // Returns { samples, coverage }; coverage describes this bounded sampled screen,
+  // never full parcel coverage or proof that all possible descents were searched.
 
   // Configurable zone scan sensitivity
   let zoneSlopeThreshold = 12; // minimum slope to count as "steep" (default: moderate)
@@ -1049,6 +1050,9 @@ out body geom;`;
     const results = [];
     let processed = 0;
     const total = gridSize * gridSize;
+    const coverage = { scope: 'sampled_grid_and_traces', totalSamples: total,
+      measuredSamples: 0, missingElevationSamples: 0, missingSlopeSamples: 0,
+      incompleteTraces: 0, limitedTraces: 0, complete: false };
 
     for (let i = 0; i < gridSize; i++) {
       const rowLat = bounds.south + latStep * (i + 0.5);
@@ -1065,10 +1069,13 @@ out body geom;`;
         if (onProgress && processed % 10 === 0) onProgress(processed, total, 'Scanning terrain');
 
         const elev = getElevationFast(lat, lng);
-        if (isNaN(elev) || elev < (options.minElevation ?? 300)) continue;
+        if (!Number.isFinite(elev)) { coverage.missingElevationSamples++; continue; }
+        if (elev < (options.minElevation ?? 300)) { coverage.measuredSamples++; continue; }
 
         const analysis = analyzeFast(lat, lng, 0.0005);
-        if (!analysis || isNaN(analysis.slope) || analysis.slope < slopeThreshold) continue;
+        if (!analysis || !Number.isFinite(analysis.slope)) { coverage.missingSlopeSamples++; continue; }
+        coverage.measuredSamples++;
+        if (analysis.slope < slopeThreshold) continue;
 
         // Walk downhill from this point, counting how much vert we get
         // while the slope stays above threshold
@@ -1079,12 +1086,21 @@ out body geom;`;
         let prevElev = elev;
         let flatStreak = 0;
 
+        let traceFinished = false;
         for (let step = 0; step < maxSteps; step++) {
+          // smoothGradient otherwise ignores missing neighbours. Do not let a
+          // truncated stencil masquerade as a measured end of the descent.
+          const offsets = [[0,0],[1,0],[-1,0],[0,1],[0,-1],
+            [Math.SQRT1_2,Math.SQRT1_2],[Math.SQRT1_2,-Math.SQRT1_2],
+            [-Math.SQRT1_2,Math.SQRT1_2],[-Math.SQRT1_2,-Math.SQRT1_2]];
+          if (!offsets.every(([dy,dx]) => Number.isFinite(getElevationFast(curLat + dy*stepDelta, curLng + dx*stepDelta)))) {
+            coverage.incompleteTraces++; traceFinished = true; break;
+          }
           const sg = smoothGradient(curLat, curLng, stepDelta);
-          if (!sg) break;
+          if (!sg) { traceFinished = true; break; }
 
           const a = analyzeFast(curLat, curLng, stepDelta);
-          if (!a || isNaN(a.slope)) break;
+          if (!a || !Number.isFinite(a.slope)) { coverage.incompleteTraces++; traceFinished = true; break; }
 
           if (a.slope >= slopeThreshold) {
             steepVert += Math.max(0, prevElev - a.elevation);
@@ -1095,7 +1111,7 @@ out body geom;`;
             flatStreak = 0;
           } else {
             flatStreak += stepMeters;
-            if (flatStreak > zoneFlatTolerance) break; // too much flat, stop
+            if (flatStreak > zoneFlatTolerance) { traceFinished = true; break; } // measured flat runout
           }
 
           // Step downhill
@@ -1103,7 +1119,9 @@ out body geom;`;
           curLng += (sg.dxNorm * stepMeters) / metersPerDegLng(curLat);
         }
 
-        if (steepVert >= minVerticalDrop * 0.33) { // at least a third of min vert in steep terrain
+        if (!traceFinished) coverage.limitedTraces++;
+
+        if (steepVert >= (options.minVerticalDrop ?? minVerticalDrop) * 0.33) { // at least a third of min vert in steep terrain
           const avgAspect = (Math.atan2(totalAspectSin / steepCount, totalAspectCos / steepCount) * RAD2DEG + 360) % 360;
           results.push({
             lat, lng, elevation: elev,
@@ -1115,7 +1133,21 @@ out body geom;`;
       }
     }
 
-    return results;
+    coverage.complete = coverage.missingElevationSamples === 0 && coverage.missingSlopeSamples === 0
+      && coverage.incompleteTraces === 0 && coverage.limitedTraces === 0;
+    return { samples: results, coverage };
+  }
+
+  // Retention and preference are separate. Width remains the existing screen;
+  // these zones are terrain search extents, never cadastral plots.
+  function screenMissionZones(zones, coverage) {
+    const retained = zones.filter(z => z.maxVert >= 150 && z.width >= 200)
+      .map(z => ({ ...z, preferredVertical: z.maxVert >= 250 }))
+      .sort((a,b) => b.maxVert-a.maxVert || b.pointCount-a.pointCount);
+    const incomplete = coverage?.complete !== true;
+    return { zones: retained, status: incomplete ? 'data_review' : retained.length ? 'complete' : 'rejected',
+      reason: incomplete ? 'Elevation coverage or bounded descent analysis is incomplete; retain for data review.'
+        : retained.length ? null : 'No sampled candidate passed 150m vertical / 200m span; 250m is preferred.' };
   }
 
   // Cluster adjacent heatmap points into zones
@@ -1368,6 +1400,7 @@ out body geom;`;
     setZoneSensitivity,
     getZoneSensitivity,
     scanZones,
+    screenMissionZones,
     clusterZones,
     scoreZone,
     generateZoneName,

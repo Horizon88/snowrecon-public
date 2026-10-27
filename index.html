@@ -2490,7 +2490,7 @@ async function runMissionWorker(agentName) {
           reconMission.candidates.push(candidate);
           if (candidate.lat >= 44.35 && candidate.lat <= 49.01 && candidate.lng >= -116.1 && candidate.lng <= -104.0) autoLandChecks.push(candidate.id);
         } else if (candidate.score > dupe.score || (candidate.catAccess && !dupe.catAccess)) {
-          Object.assign(dupe, candidate, { id: dupe.id });
+          replaceMissionCandidateEvidence(dupe, candidate);
           if (!dupe.landCheck && dupe.lat >= 44.35 && dupe.lat <= 49.01 && dupe.lng >= -116.1 && dupe.lng <= -104.0) autoLandChecks.push(dupe.id);
         }
       }
@@ -2569,8 +2569,28 @@ function sidelineMissionCandidate(event, id) {
   saveReconMission(); renderMissionCockpit(); drawMissionCandidates();
 }
 
+// A fresh scan must not inherit an older scan's completeness or erase a review.
+function replaceMissionCandidateEvidence(existing, candidate) {
+  const history = Array.isArray(existing.terrainReviewHistory) ? existing.terrainReviewHistory.slice() : [];
+  history.push(JSON.parse(JSON.stringify({
+    scannedAt: existing.scannedAt, terrainReviewStatus: existing.terrainReviewStatus,
+    qualifyingSamples: existing.qualifyingSamples, flags: existing.flags, catAccess: existing.catAccess,
+  })));
+  const reviewed = existing.verdict === 'reject' || existing.rejectedAt
+    || (candidate.verdict !== 'reject' && (existing.manualReview
+      || (existing.verdict === 'sideline' && existing.rejectReason)));
+  const savedReview = reviewed ? {
+    verdict: existing.verdict, rejectReason: existing.rejectReason,
+    rejectedAt: existing.rejectedAt, manualReview: existing.manualReview,
+  } : {};
+  const terrainReviewStatus = ['complete', 'data_review'].includes(candidate.terrainReviewStatus)
+    ? candidate.terrainReviewStatus : 'unknown';
+  Object.assign(existing, candidate, { id: existing.id, terrainReviewStatus, terrainReviewHistory: history }, savedReview);
+  return existing;
+}
+
 // Describe stored evidence without assigning an uncalibrated probability.
-// Older confidence fields remain in saved records and exports unchanged.
+// Older confidence fields remain in saved records unchanged.
 function missionEvidenceSummary(candidate) {
   const count = candidate.qualifyingSamples;
   const samples = Number.isInteger(count) && count >= 0

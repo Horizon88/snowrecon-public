@@ -241,7 +241,12 @@
       <button class="btn" onclick="rejectCurrentMapArea()" style="color:var(--red);border-color:rgba(239,68,68,.45)" title="Reject everything inside the current map view and remember why">Reject View</button>
       <button class="btn" onclick="clearReconMission()">Clear</button>
     </div>
+    <div style="margin-bottom:6px">
+      <button class="btn" onclick="exportMissionHistory()" title="Download current and archived mission evidence and review history">Export History</button>
+      <button class="btn" onclick="removeExportedMissionArchives()" title="Remove only archived records included in your saved export">Remove exported archives</button>
+    </div>
     <div style="font-size:8px;color:var(--dim);margin:-2px 0 6px">Japan uses smaller 4 km search cells. Zoom around Yotei and choose <b style="color:var(--red)">Reject View</b> to exclude that area permanently.</div>
+    <div id="missionStorageWarning" role="alert" style="display:none;color:#ffb46b;padding:8px 0"></div>
     <div id="missionPanel" style="display:none;margin-bottom:8px">
       <div class="mission-progress"><div id="missionProgressBar"></div></div>
       <div id="missionStatus" style="font-size:9px;color:var(--orange);margin:4px 0">Preparing…</div>
@@ -2149,6 +2154,13 @@ let missionStopRequested = false;
 let missionLayer = L.layerGroup().addTo(map);
 let missionParcelLayer = L.layerGroup().addTo(map);
 const missionParcelGeometry = new Map();
+const missionLandRequests = new WeakMap();
+let missionLandBatch = null;
+let missionActiveRaw = null;
+let missionExportedArchives = null;
+let missionExportedActive = null;
+// Persistence is independent of whether research is running, stopped or complete.
+let missionPersistence = { unsaved: false, archiveWarning: '', notice: '' };
 
 function escapeLandText(value) {
   return String(value == null ? '' : value).replace(/[&<>'"]/g, ch => ({
@@ -2160,19 +2172,22 @@ function landCheckLabel(candidate) {
   const land = candidate.landCheck;
   if (!land) return 'Land unchecked';
   if (land.status === 'checking') return 'Checking official parcels…';
+  if (land.status === 'interrupted') return 'Land check interrupted · retry needed';
   if (land.status === 'unsupported_jurisdiction') return 'Parcel adapter not connected here';
   if (land.status === 'no_parcel_at_point') return 'No mapped parcel at candidate center';
   if (land.status === 'error') return `Land check error: ${land.error || 'retry'}`;
+  if (land.status === 'incomplete') return 'Parcel evidence incomplete · recheck needed';
   if (land.status !== 'matched') return 'Land status unknown';
-  const p = land.parcels[0] || {};
-  const acres = p.acres == null ? 'acreage unknown' : `${p.acres.toFixed(0)} ac`;
-  return `${land.landPathLabel} · ${acres}`;
+  const p = firstMissionParcel(land);
+  if (!p) return 'Parcel evidence incomplete · recheck needed';
+  const acres = Number.isFinite(p.acres) && p.acres >= 0 ? `${p.acres.toFixed(0)} ac` : 'acreage unknown';
+  return `${land.landPathLabel || 'Ownership diligence'} · ${acres}`;
 }
 
 function scoreLandFit(candidate, payload) {
-  const parcel = payload.parcels[0];
-  if (!parcel) return { score25: 0, combinedScore: Math.round(candidate.score * .75), landPath: 'no_match', landPathLabel: 'No parcel match' };
-  const acres = Math.max(0, parcel.acres || 0);
+  const parcel = firstMissionParcel(payload);
+  if (!parcel) return { score25: null, combinedScore: null, landPath: 'unknown', landPathLabel: 'Parcel evidence incomplete' };
+  const acres = Number.isFinite(parcel.acres) ? Math.max(0, parcel.acres) : 0;
   const ownershipPts = parcel.ownershipClass === 'private' ? 15 : parcel.ownershipClass === 'public' ? 4 : 2;
   const acreagePts = Math.min(10, acres / 16);
   const score25 = Math.round(Math.min(25, ownershipPts + acreagePts));
@@ -2189,16 +2204,30 @@ function scoreLandFit(candidate, payload) {
   return { score25, combinedScore: Math.round(candidate.score * .75 + score25), landPath, landPathLabel };
 }
 
+function firstMissionParcel(land) {
+  const parcel = Array.isArray(land?.parcels) ? land.parcels[0] : null;
+  return parcel && typeof parcel === 'object' && !Array.isArray(parcel) && Object.keys(parcel).length ? parcel : null;
+}
+
+// A persisted matched marker is insufficient without its underlying parcel record.
+// Keep old source/fit fields intact, but never use that incomplete fit as current evidence.
+function currentMissionLandFit(candidate) {
+  const land = candidate.landCheck;
+  if (land?.status === 'checking' || land?.status === 'interrupted') return null;
+  return land?.status === 'matched' && !firstMissionParcel(land) ? null : land;
+}
+
 function missionCandidateSort(a, b) {
   if (a.verdict === 'reject' && b.verdict !== 'reject') return 1;
   if (b.verdict === 'reject' && a.verdict !== 'reject') return -1;
   const landRank = { purchase_lead: 4, private_followup: 3, permit_path: 2, diligence: 1 };
-  const rankDiff = (landRank[b.landCheck?.landPath] || 0) - (landRank[a.landCheck?.landPath] || 0);
+  const aFit = currentMissionLandFit(a), bFit = currentMissionLandFit(b);
+  const rankDiff = (landRank[bFit?.landPath] || 0) - (landRank[aFit?.landPath] || 0);
   if (rankDiff) return rankDiff;
   const verdictRank = { advance: 3, sideline: 2, watch: 2, reject: 1 };
   const verdictDiff = (verdictRank[b.verdict] || 0) - (verdictRank[a.verdict] || 0);
   if (verdictDiff) return verdictDiff;
-  return (b.landCheck?.combinedScore ?? b.score) - (a.landCheck?.combinedScore ?? a.score);
+  return (bFit?.combinedScore ?? b.score) - (aFit?.combinedScore ?? a.score);
 }
 
 function publicNullableNumber(value) {
@@ -2245,22 +2274,62 @@ async function fetchOfficialLandParcels(lat, lng) {
 }
 
 async function checkMissionCandidateLand(candidateId, options = {}) {
-  if (!reconMission) return;
-  const candidate = reconMission.candidates.find(c => c.id === candidateId);
+  const mission = reconMission;
+  if (!mission) return;
+  const candidate = mission.candidates.find(c => c.id === candidateId);
   if (!candidate) return;
-  candidate.landCheck = { status: 'checking', checkedAt: new Date().toISOString() };
+  const queryPosition = { lat: candidate.lat, lng: candidate.lng };
+  const active = missionLandRequests.get(candidate);
+  if (active?.mission === mission && active.pending === candidate.landCheck && active.promise
+      && active.queryPosition.lat === queryPosition.lat && active.queryPosition.lng === queryPosition.lng) {
+    const result = await active.promise;
+    if (!options.silent && result && reconMission === mission && mission.candidates.includes(candidate)
+        && candidate.lat === queryPosition.lat && candidate.lng === queryPosition.lng && candidate.landCheck === result) {
+      renderMissionCockpit(); drawMissionCandidates();
+    }
+    return result;
+  }
+  const request = { mission, queryPosition, pending: null, promise: null };
+  missionLandRequests.set(candidate, request);
+  request.promise = performMissionLandCheck(candidate, request, options);
+  try { return await request.promise; }
+  finally { if (missionLandRequests.get(candidate) === request) missionLandRequests.delete(candidate); }
+}
+
+async function performMissionLandCheck(candidate, request, options) {
+  const { mission, queryPosition } = request;
+  const bulkOwner = missionLandBatch?.mission === mission ? missionLandBatch : null;
+  if (candidate.landCheck && candidate.landCheck.status !== 'checking') {
+    candidate.landCheckHistory ||= [];
+    candidate.landCheckHistory.push(JSON.parse(JSON.stringify(candidate.landCheck)));
+  }
+  const pending = { status: 'checking', checkedAt: new Date().toISOString(), queryPosition };
+  request.pending = pending;
+  candidate.landCheck = pending;
+  missionParcelGeometry.delete(candidate.id);
+  candidate.flags = (candidate.flags || []).filter(flag => flag !== 'public_land_requires_permission');
+  if (!candidate.flags.includes('parcel_status_unknown')) candidate.flags.push('parcel_status_unknown');
+  const isCurrent = () => reconMission === mission && mission.candidates.includes(candidate)
+    && candidate.lat === queryPosition.lat && candidate.lng === queryPosition.lng
+    && candidate.landCheck === pending;
   if (!options.silent) renderMissionCockpit();
   try {
-    const payload = await fetchOfficialLandParcels(candidate.lat, candidate.lng);
+    const payload = await fetchOfficialLandParcels(queryPosition.lat, queryPosition.lng);
+    if (!isCurrent()) return null;
     if (!payload.supported) {
       candidate.landCheck = {
-        status: payload.status || 'unsupported_jurisdiction', checkedAt: payload.checkedAt,
+        status: payload.status || 'unsupported_jurisdiction', checkedAt: payload.checkedAt, queryPosition,
         message: payload.message, provider: payload.provider || null, parcels: [], score25: 0,
         combinedScore: Math.round(candidate.score * .75), landPath: 'unsupported', landPathLabel: 'Parcel adapter unavailable'
       };
-    } else if (!payload.parcels?.length) {
+    } else if (!firstMissionParcel(payload) && (payload.status === 'matched' || !Array.isArray(payload.parcels) || payload.parcels.length)) {
+      // Preserve an incomplete response for review without treating it as no match.
+      candidate.landCheck = { ...payload, status: payload.status || 'incomplete', queryPosition,
+        fitStatus: 'incomplete_parcel_evidence', score25: null, combinedScore: null,
+        landPath: 'unknown', landPathLabel: 'Parcel evidence incomplete' };
+    } else if (!payload.parcels.length) {
       candidate.landCheck = {
-        status: payload.status || 'no_parcel_at_point', checkedAt: payload.checkedAt,
+        status: payload.status || 'no_parcel_at_point', checkedAt: payload.checkedAt, queryPosition,
         provider: payload.provider, jurisdiction: payload.jurisdiction, parcels: [], score25: 0,
         combinedScore: Math.round(candidate.score * .75), landPath: 'no_match', landPathLabel: 'No mapped parcel match'
       };
@@ -2268,38 +2337,63 @@ async function checkMissionCandidateLand(candidateId, options = {}) {
       const fit = scoreLandFit(candidate, payload);
       candidate.landCheck = {
         status: 'matched', checkedAt: payload.checkedAt, provider: payload.provider,
-        jurisdiction: payload.jurisdiction, parcels: payload.parcels.map(({ geometry, ...parcel }) => parcel),
-        ...fit, legalAccess: 'unverified', titleVerified: false, availability: 'unknown'
+        jurisdiction: payload.jurisdiction, parcels: payload.parcels.map(p => {
+          if (!p || typeof p !== 'object' || Array.isArray(p)) return p;
+          const { geometry, ...parcel } = p; return parcel;
+        }),
+        ...fit, queryPosition, legalAccess: 'unverified', titleVerified: false, availability: 'unknown'
       };
-      missionParcelGeometry.set(candidate.id, payload.parcels.map(p => p.geometry).filter(Boolean));
-      candidate.flags = (candidate.flags || []).filter(flag => flag !== 'parcel_status_unknown');
+      missionParcelGeometry.set(candidate.id, payload.parcels.map(p => p?.geometry).filter(Boolean));
+      candidate.flags = candidate.flags.filter(flag => flag !== 'parcel_status_unknown');
       if (fit.landPath === 'permit_path' && !candidate.flags.includes('public_land_requires_permission')) candidate.flags.push('public_land_requires_permission');
     }
   } catch (error) {
-    candidate.landCheck = { status: 'error', checkedAt: new Date().toISOString(), error: error.message,
+    if (!isCurrent()) return null;
+    candidate.landCheck = { status: 'error', checkedAt: new Date().toISOString(), queryPosition, error: error.message,
       parcels: [], score25: 0, combinedScore: Math.round(candidate.score * .75), landPath: 'error', landPathLabel: 'Land check failed' };
   }
-  reconMission.candidates.sort(missionCandidateSort);
-  saveReconMission();
-  if (!options.silent) { renderMissionCockpit(); drawMissionCandidates(); }
+  mission.candidates.sort(missionCandidateSort);
+  const saved = saveReconMission();
+  // A cancelled bulk owner will not repaint, including late current results
+  // after storage recovers. The request's identity guards above still apply.
+  if (!saved || !options.silent || mission.status === 'stopped'
+      || (bulkOwner && missionLandBatch !== bulkOwner)) { renderMissionCockpit(); drawMissionCandidates(); }
   return candidate.landCheck;
 }
 
-async function checkMissionLand() {
-  if (!reconMission?.candidates?.length) { log('Run a Recon Mission first; land checks attach to ranked terrain leads.', 'warn'); return; }
+function resetMissionLandBatch() {
+  missionLandBatch = null;
   const button = document.getElementById('missionLandBtn');
-  const queue = reconMission.candidates.filter(c => c.landCheck?.status !== 'matched').slice(0, 30);
+  const stopping = missionRunning && reconMission?.status === 'stopped';
+  button.disabled = stopping; button.textContent = stopping ? 'Stopping…' : 'Check Land';
+}
+
+async function checkMissionLand() {
+  const mission = reconMission;
+  if (!mission?.candidates?.length) { log('Run a Recon Mission first; land checks attach to ranked terrain leads.', 'warn'); return; }
+  if (missionRunning && mission.status === 'stopped') return;
+  if (missionLandBatch?.mission === mission) return;
+  const button = document.getElementById('missionLandBtn');
+  const queue = mission.candidates.filter(c => !(c.landCheck?.status === 'matched' && firstMissionParcel(c.landCheck))).slice(0, 30);
   if (!queue.length) { drawMissionCandidates(); log('All ranked leads already have land checks.', 'ok'); return; }
+  const operation = { mission };
+  missionLandBatch = operation;
+  const isCurrent = () => reconMission === mission && missionLandBatch === operation;
   button.disabled = true;
-  for (let i = 0; i < queue.length; i += 3) {
-    const batch = queue.slice(i, i + 3);
-    button.textContent = `Land ${Math.min(i + batch.length, queue.length)}/${queue.length}`;
-    await Promise.all(batch.map(c => checkMissionCandidateLand(c.id, { silent: true })));
-    renderMissionCockpit(); drawMissionCandidates();
+  try {
+    for (let i = 0; i < queue.length; i += 3) {
+      if (!isCurrent()) return;
+      const batch = queue.slice(i, i + 3).filter(c => mission.candidates.includes(c));
+      button.textContent = `Land ${Math.min(i + 3, queue.length)}/${queue.length}`;
+      await Promise.all(batch.map(c => checkMissionCandidateLand(c.id, { silent: true })));
+      if (!isCurrent()) return;
+      renderMissionCockpit(); drawMissionCandidates();
+    }
+    const matches = mission.candidates.filter(c => c.landCheck?.status === 'matched' && firstMissionParcel(c.landCheck)).length;
+    log(`Official parcel screening complete: ${matches} candidate centers matched to mapped parcels. Title, availability and legal access remain unverified.`, matches ? 'ok' : 'warn');
+  } finally {
+    if (missionLandBatch === operation) resetMissionLandBatch();
   }
-  button.disabled = false; button.textContent = 'Check Land';
-  const matches = reconMission.candidates.filter(c => c.landCheck?.status === 'matched').length;
-  log(`Official parcel screening complete: ${matches} candidate centers matched to mapped parcels. Title, availability and legal access remain unverified.`, matches ? 'ok' : 'warn');
 }
 
 function escapeHtml(value) {
@@ -2352,24 +2446,202 @@ function missionDistanceM(a, b) {
 }
 
 function saveReconMission() {
-  if (!reconMission) return localStorage.removeItem(MISSION_KEY);
-  localStorage.setItem(MISSION_KEY, JSON.stringify(reconMission));
+  // Only explicit Clear removes ACTIVE. A failed or unreadable load must not
+  // turn a routine save into deletion of the original bytes.
+  if (!reconMission) return true;
+  try {
+    localStorage.setItem(MISSION_KEY, JSON.stringify(reconMission));
+    missionActiveRaw = null;
+    missionPersistence.unsaved = false;
+    missionPersistence.notice = '';
+    renderMissionStorageWarning();
+    renderMissionStatus();
+    return true;
+  } catch (_) {
+    missionPersistence.unsaved = true;
+    missionStopRequested = true;
+    if (missionRunning) reconMission.status = 'stopped';
+    // Keep missionRunning true until actual workers settle; never permit a
+    // replacement while a pending result can still update this mission.
+    resetMissionLandBatch();
+    document.getElementById('missionPauseBtn').disabled = true;
+    renderMissionStorageWarning();
+    renderMissionStatus();
+    log('Mission changes are unsaved; browser storage could not save them. Previously stored bytes are unchanged.', 'warn');
+    return false;
+  }
+}
+
+function renderMissionStorageWarning() {
+  const messages = [missionPersistence.unsaved
+    ? 'Changes are unsaved: results remain in memory and previously stored bytes are unchanged. Export History before leaving this page; free storage and retry saving.' : '',
+    missionPersistence.archiveWarning, missionPersistence.notice].filter(Boolean);
+  const warning = document.getElementById('missionStorageWarning');
+  warning.textContent = messages.join(' ');
+  warning.style.display = messages.length ? 'block' : 'none';
+}
+
+function showMissionStorageWarning(message) {
+  missionPersistence.notice = message;
+  renderMissionStorageWarning();
+  log(message, 'warn');
+}
+
+function readMissionHistory() {
+  const prefix = MISSION_KEY + ':history:';
+  const archived = [], unreadable = [];
+  const keys = Array.from({ length: localStorage.length }, (_, i) => localStorage.key(i))
+    .filter(key => key && key.startsWith(prefix)).sort();
+  for (const key of keys) {
+    const raw = localStorage.getItem(key);
+    if (raw == null) continue;
+    try {
+      const entry = JSON.parse(raw);
+      const hasMission = entry?.mission && typeof entry.mission === 'object' && !Array.isArray(entry.mission);
+      if (entry?.version !== 1 || (!hasMission && typeof entry?.activeRaw !== 'string')
+          || typeof entry.reason !== 'string' || typeof entry.archivedAt !== 'string') throw new Error('Unknown history format');
+      archived.push({ ...entry, key });
+    } catch (_) { unreadable.push({ key, raw }); }
+  }
+  archived.sort((a, b) => a.archivedAt.localeCompare(b.archivedAt) || a.key.localeCompare(b.key));
+  return { archived, unreadable };
+}
+
+function showMissionHistoryError() {
+  const message = 'Could not save mission history; existing results are retained. Export History, open the saved file, then remove exported archives to free space and retry.';
+  document.getElementById('missionPanel').style.display = 'block';
+  document.getElementById('missionStatus').textContent = message;
+  missionPersistence.archiveWarning = message;
+  renderMissionStorageWarning();
+  log(message, 'warn');
+}
+
+function archiveReconMission(reason) {
+  try {
+    const activeRaw = reconMission ? null : (missionActiveRaw ?? localStorage.getItem(MISSION_KEY));
+    if (!reconMission && activeRaw == null) return true;
+    const snapshot = reconMission ? JSON.stringify(reconMission) : null;
+    // Separate immutable keys retain old records, including unreadable ACTIVE.
+    if (readMissionHistory().archived.some(entry => snapshot !== null
+      ? JSON.stringify(entry.mission) === snapshot : entry.activeRaw === activeRaw)) {
+      missionPersistence.archiveWarning = '';
+      renderMissionStorageWarning();
+      return true;
+    }
+    const suffix = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const key = MISSION_KEY + ':history:' + suffix;
+    if (localStorage.getItem(key) != null) throw new Error('History key collision');
+    const raw = JSON.stringify({ version: 1, archivedAt: new Date().toISOString(), reason,
+      ...(snapshot !== null ? { mission: JSON.parse(snapshot) } : { activeRaw }) });
+    localStorage.setItem(key, raw);
+    if (localStorage.getItem(key) !== raw) throw new Error('History write was not retained');
+    missionPersistence.archiveWarning = '';
+    renderMissionStorageWarning();
+    return true;
+  } catch (_) {
+    showMissionHistoryError();
+    const proceed = confirmExportedMissionFallback();
+    if (proceed) { missionPersistence.archiveWarning = ''; renderMissionStorageWarning(); }
+    return proceed;
+  }
+}
+
+function confirmExportedMissionFallback() {
+  // An export can serve as the only archive only after a failed browser archive
+  // write, with exact proof that neither RAM nor stored ACTIVE changed since it.
+  try {
+    const proof = missionExportedActive;
+    const storedRaw = localStorage.getItem(MISSION_KEY) ?? null;
+    const activeRaw = reconMission ? null : (missionActiveRaw ?? storedRaw);
+    if (!proof || proof.snapshot !== JSON.stringify(reconMission)
+        || proof.activeRaw !== activeRaw || proof.storedRaw !== storedRaw) return false;
+    return confirm('Browser storage could not save a mission archive. Have you saved and opened the exported history file? Continue using that downloaded file as the ONLY archive of this exact mission? Clearing or replacing it will remove it from this browser. Cancel if the file is not safely saved.');
+  } catch (_) { return false; }
+}
+
+function missionHistoryExport() {
+  const history = readMissionHistory();
+  const archiveRaw = [...history.archived, ...history.unreadable]
+    .map(({ key }) => ({ key, raw: localStorage.getItem(key) }));
+  return { version: 1, exportedAt: new Date().toISOString(), ...history, archiveRaw,
+    active: reconMission ? JSON.parse(JSON.stringify(reconMission)) : null,
+    activeStoredRaw: localStorage.getItem(MISSION_KEY) ?? null,
+    activeRaw: reconMission ? null : (missionActiveRaw ?? localStorage.getItem(MISSION_KEY) ?? null) };
+}
+
+function exportMissionHistory() {
+  missionExportedActive = null;
+  missionExportedArchives = null;
+  try {
+    const data = missionHistoryExport();
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a'); a.href = url; a.download = 'snowrecon-mission-history.json'; a.click();
+    missionExportedArchives = data.archiveRaw;
+    missionExportedActive = { snapshot: JSON.stringify(data.active), activeRaw: data.activeRaw, storedRaw: data.activeStoredRaw };
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  } catch (_) {
+    showMissionStorageWarning('Mission history could not be exported; saved records are unchanged.');
+  }
+}
+
+function removeExportedMissionArchives() {
+  if (!missionExportedArchives?.length) {
+    showMissionStorageWarning('Export History first, save and open the downloaded file, then remove exported archives.');
+    return;
+  }
+  if (!confirm('Have you saved and opened the exported history file? Remove only the archived records included in that export from this browser? The active mission stays here. Cancel if your export is not safely saved.')) return;
+  try {
+    // New or changed entries after export are never removed by this action.
+    for (const { key, raw } of missionExportedArchives) {
+      if (key.startsWith(MISSION_KEY + ':history:') && localStorage.getItem(key) === raw) localStorage.removeItem(key);
+    }
+    missionExportedArchives = null;
+    showMissionStorageWarning('Exported archives removed. The active mission and in-memory results are retained. Retry saving or resume the mission; keep your exported file.');
+  } catch (_) {
+    showMissionStorageWarning('Could not remove all exported archives. The active mission is unchanged; keep your export and retry archive removal.');
+  }
 }
 
 function loadReconMission() {
-  try { reconMission = JSON.parse(localStorage.getItem(MISSION_KEY) || 'null'); }
-  catch (_) { reconMission = null; }
+  resetMissionLandBatch();
+  const raw = localStorage.getItem(MISSION_KEY);
+  try {
+    const loaded = JSON.parse(raw || 'null');
+    const record = value => value && typeof value === 'object' && !Array.isArray(value);
+    if (loaded !== null && (!record(loaded) || !Array.isArray(loaded.cells) || !loaded.cells.every(record)
+        || !Array.isArray(loaded.candidates) || !loaded.candidates.every(c => record(c)
+          && Number.isFinite(c.lat) && Number.isFinite(c.lng) && (c.flags == null || Array.isArray(c.flags)))
+        || (loaded.exclusions != null && !Array.isArray(loaded.exclusions)))) throw new Error('Invalid mission shape');
+    reconMission = loaded;
+    missionActiveRaw = null;
+  } catch (_) {
+    reconMission = null;
+    missionActiveRaw = raw;
+    showMissionStorageWarning('Saved mission data could not be loaded. Original bytes are retained and included in Export History. Clear or a new mission must archive those bytes first.');
+  }
   if (reconMission) {
     reconMission.exclusions ||= [];
     // Browser refresh/crash recovery: work that was in-flight is safe to retry.
     reconMission.cells.forEach(c => { if (c.status === 'running') { c.status = 'pending'; c.agent = null; } });
     if (reconMission.status === 'running') reconMission.status = 'paused';
     reconMission.candidates.forEach(c => {
+      if (c.landCheck?.status === 'checking') {
+        // The old request cannot continue after reload. Retain it as a detached
+        // request record, not a completed source result, and wait for explicit retry.
+        const interruptedRequest = JSON.parse(JSON.stringify(c.landCheck));
+        c.landCheck = { ...c.landCheck, status: 'interrupted', interruptedRequest };
+        missionParcelGeometry.delete(c.id);
+        c.flags = (c.flags || []).filter(flag => flag !== 'public_land_requires_permission');
+        if (!c.flags.includes('parcel_status_unknown')) c.flags.push('parcel_status_unknown');
+      }
       if (!c.catAccess || c.catAccess.grade) return;
       const d = c.catAccess.distanceKm * 1000, s = c.catAccess.maxSlopeDeg;
       c.catAccess.grade = d <= 2000 && s <= 18 ? 'A' : d <= 4000 && s <= 20 ? 'B' : d <= 7000 && s <= 24 ? 'C' : 'F';
     });
+    reconMission.candidates.sort(missionCandidateSort);
     document.getElementById('missionPanel').style.display = 'block';
+    document.getElementById('missionLaunchBtn').textContent = reconMission.status === 'complete' ? 'Mission Complete' : 'Resume Mission';
     renderMissionCockpit();
     saveReconMission();
   }
@@ -2383,8 +2655,19 @@ async function launchReconMission() {
   const radiusKm = +document.getElementById('missionRadius').value;
   const minElevation = currentRegion === 'japan' ? 250 : +document.getElementById('baseElevSlider').value;
   const cellKm = currentRegion === 'japan' ? 4 : 12;
-  if (!reconMission || reconMission.status === 'complete' || reconMission.status === 'stopped' || reconMission.cellKm !== cellKm) {
+  // Resume uses the saved mission's cells, candidates and review history.
+  // Its sampling mode must still match the selected region.
+  if (reconMission && reconMission.status !== 'complete' && reconMission.cellKm !== cellKm) {
+    const savedRegion = reconMission.cellKm === 4 ? 'Japan' : reconMission.cellKm === 12 ? 'USA' : 'unknown';
+    const message = `Switch back to the saved mission region (${savedRegion}) to resume; its results and reviews are retained.`;
+    document.getElementById('missionStatus').textContent = message;
+    log(message, 'warn');
+    return;
+  }
+  if (!reconMission || reconMission.status === 'complete' || reconMission.cellKm !== cellKm) {
+    if (!archiveReconMission('completed_replacement')) return;
     const priorExclusions = reconMission?.exclusions || [];
+    resetMissionLandBatch();
     reconMission = {
       version: 1, id: `mission-${Date.now()}`, name: center.name || 'Recon mission',
       createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
@@ -2399,16 +2682,26 @@ async function launchReconMission() {
   document.getElementById('missionPanel').style.display = 'block';
   document.getElementById('missionPauseBtn').disabled = false;
   document.getElementById('missionLaunchBtn').disabled = true;
-  renderMissionCockpit(); saveReconMission();
+  renderMissionCockpit();
+  if (!saveReconMission()) {
+    missionRunning = false;
+    resetMissionLandBatch();
+    document.getElementById('missionLaunchBtn').disabled = false;
+    document.getElementById('missionLaunchBtn').textContent = 'Resume Mission';
+    document.getElementById('missionPauseBtn').disabled = true;
+    renderMissionCockpit();
+    return;
+  }
   await Promise.all([runMissionWorker('Alpine-1'), runMissionWorker('Alpine-2')]);
   if (!missionStopRequested && reconMission.cells.every(c => ['complete','rejected','error'].includes(c.status))) {
     reconMission.status = 'complete';
   }
   missionRunning = false;
+  if (!missionLandBatch) resetMissionLandBatch();
   document.getElementById('missionLaunchBtn').disabled = false;
   document.getElementById('missionLaunchBtn').textContent = reconMission.status === 'complete' ? 'Mission Complete' : 'Resume Mission';
   document.getElementById('missionPauseBtn').disabled = true;
-  saveReconMission(); renderMissionCockpit();
+  saveReconMission(); renderMissionCockpit(); drawMissionCandidates();
 }
 
 async function runMissionWorker(agentName) {
@@ -2418,7 +2711,12 @@ async function runMissionWorker(agentName) {
     if (!cell) return;
     cell.status = 'running'; cell.agent = agentName; cell.attempts++;
     reconMission.updatedAt = new Date().toISOString();
-    renderMissionCockpit(); saveReconMission();
+    renderMissionCockpit();
+    if (!saveReconMission()) {
+      cell.status = 'pending'; cell.agent = null; cell.attempts--;
+      renderMissionCockpit();
+      return;
+    }
     try {
       RunEngine.setZoneSensitivity(12, 180);
       // Keep sample spacing below the clustering radius. The first mission build
@@ -2469,7 +2767,7 @@ async function runMissionWorker(agentName) {
           id: missionHash(zone.centroidLat, zone.centroidLng), cellId: cell.id, agent: agentName,
           lat: zone.centroidLat, lng: zone.centroidLng, scannedAt: new Date().toISOString(),
           verdict: zone.maxVert >= 350 && route ? 'advance' : 'watch',
-          score: missionScore, confidence: route ? 0.58 : 0.35,
+          score: missionScore,
           verticalM: Math.round(zone.maxVert), clusterSpanM: zone.width,
           aspect: zone.aspectDir, elevationMinM: Math.round(zone.minElev), elevationMaxM: Math.round(zone.maxElev),
           qualifyingSamples: zone.pointCount,
@@ -2482,19 +2780,18 @@ async function runMissionWorker(agentName) {
         };
         const exclusion = findMissionExclusion(candidate.lat, candidate.lng);
         if (exclusion) {
-          candidate.verdict = 'reject'; candidate.rejectReason = exclusion.reason;
-          candidate.rejectedAt = new Date().toISOString(); candidate.flags.unshift('inside_rejected_area');
+          applyMissionScanExclusion(candidate, exclusion);
         } else if (candidate.verdict === 'watch') candidate.verdict = 'sideline';
         const dupe = reconMission.candidates.find(c => missionDistanceM(c, candidate) < 750);
         if (!dupe) {
           reconMission.candidates.push(candidate);
           if (candidate.lat >= 44.35 && candidate.lat <= 49.01 && candidate.lng >= -116.1 && candidate.lng <= -104.0) autoLandChecks.push(candidate.id);
         } else if (candidate.score > dupe.score || (candidate.catAccess && !dupe.catAccess)) {
-          Object.assign(dupe, candidate, { id: dupe.id });
+          replaceMissionCandidateEvidence(dupe, candidate);
           if (!dupe.landCheck && dupe.lat >= 44.35 && dupe.lat <= 49.01 && dupe.lng >= -116.1 && dupe.lng <= -104.0) autoLandChecks.push(dupe.id);
         }
       }
-      await Promise.all(autoLandChecks.map(id => checkMissionCandidateLand(id, { silent: true })));
+      await Promise.all([...new Set(autoLandChecks)].map(id => checkMissionCandidateLand(id, { silent: true })));
       cell.leads = local.length;
       cell.status = 'complete';
     } catch (error) {
@@ -2520,12 +2817,20 @@ function clearReconMission() {
   if (missionRunning) {
     missionStopRequested = true;
     reconMission.status = 'stopped';
+    resetMissionLandBatch();
     document.getElementById('missionStatus').textContent = 'Stopping workers after current analysis…';
     saveReconMission();
     return;
   }
+  if (!archiveReconMission('clear')) return;
+  try { localStorage.removeItem(MISSION_KEY); }
+  catch (_) { showMissionStorageWarning('Could not remove the active mission. Its saved bytes and history are retained; retry Clear.'); return; }
+  missionActiveRaw = null;
+  missionPersistence = { unsaved: false, archiveWarning: '', notice: '' };
+  renderMissionStorageWarning();
+  resetMissionLandBatch();
   missionStopRequested = true; missionRunning = false; missionPaused = false;
-  reconMission = null; localStorage.removeItem(MISSION_KEY);
+  reconMission = null;
   missionLayer.clearLayers();
   missionParcelLayer.clearLayers(); missionParcelGeometry.clear();
   document.getElementById('missionPanel').style.display = 'none';
@@ -2538,6 +2843,15 @@ function findMissionExclusion(lat, lng) {
   return (reconMission?.exclusions || []).find(x => lat >= x.bounds.south && lat <= x.bounds.north && lng >= x.bounds.west && lng <= x.bounds.east) || null;
 }
 
+function applyMissionScanExclusion(candidate, exclusion) {
+  candidate.verdict = 'reject'; candidate.rejectReason = exclusion.reason;
+  candidate.rejectedAt = new Date().toISOString(); candidate.flags.unshift('inside_rejected_area');
+  // This applies an existing exclusion automatically; it is not a new user decision.
+  candidate.manualReview = { verdict: 'reject', reason: exclusion.reason, at: candidate.rejectedAt,
+    source: 'scan_exclusion', automated: true, position: { lat: candidate.lat, lng: candidate.lng },
+    exclusionId: exclusion.id, exclusionCreatedAt: exclusion.createdAt };
+}
+
 function rejectCurrentMapArea() {
   if (!reconMission) { alert('Launch a recon mission first, then zoom to the area you want to reject.'); return; }
   const reason = prompt('Why should this area be rejected?', 'National forest / protected land');
@@ -2547,8 +2861,7 @@ function rejectCurrentMapArea() {
   reconMission.exclusions ||= []; reconMission.exclusions.push(exclusion);
   reconMission.candidates.forEach(c => {
     if (c.lat < exclusion.bounds.south || c.lat > exclusion.bounds.north || c.lng < exclusion.bounds.west || c.lng > exclusion.bounds.east) return;
-    c.verdict='reject'; c.rejectReason=exclusion.reason; c.rejectedAt=exclusion.createdAt;
-    c.flags ||= []; if (!c.flags.includes('inside_rejected_area')) c.flags.unshift('inside_rejected_area');
+    recordMissionManualReview(c, 'reject', exclusion.reason, exclusion.createdAt, 'area', exclusion.id);
   });
   saveReconMission(); renderMissionCockpit(); drawMissionCandidates();
 }
@@ -2557,7 +2870,7 @@ function rejectMissionCandidate(event, id) {
   event.stopPropagation(); const c = reconMission?.candidates.find(x => x.id === id); if (!c) return;
   const reason = prompt('Why should this lead be rejected?', c.rejectReason || 'National forest / protected land');
   if (!reason || !reason.trim()) return;
-  c.verdict='reject'; c.rejectReason=reason.trim(); c.rejectedAt=new Date().toISOString();
+  recordMissionManualReview(c, 'reject', reason.trim(), new Date().toISOString());
   saveReconMission(); renderMissionCockpit(); drawMissionCandidates();
 }
 
@@ -2565,8 +2878,140 @@ function sidelineMissionCandidate(event, id) {
   event.stopPropagation(); const c = reconMission?.candidates.find(x => x.id === id); if (!c) return;
   const reason = prompt('Why should this lead be sidelined?', c.rejectReason || 'Needs further verification');
   if (!reason || !reason.trim()) return;
-  c.verdict='sideline'; c.rejectReason=reason.trim(); delete c.rejectedAt;
+  recordMissionManualReview(c, 'sideline', reason.trim(), new Date().toISOString());
   saveReconMission(); renderMissionCockpit(); drawMissionCandidates();
+}
+
+// Keep each decision's provenance detached from the mutable current candidate.
+function recordMissionManualReview(candidate, verdict, reason, at, source = 'candidate', exclusionId) {
+  const history = Array.isArray(candidate.manualReviewHistory) ? candidate.manualReviewHistory.slice() : [];
+  const prior = { verdict: candidate.verdict, reason: candidate.rejectReason, rejectedAt: candidate.rejectedAt,
+    position: { lat: candidate.lat, lng: candidate.lng }, flags: candidate.flags, manualReview: candidate.manualReview };
+  const decision = { verdict, reason, at, source, position: { lat: candidate.lat, lng: candidate.lng },
+    ...(exclusionId ? { exclusionId } : {}) };
+  history.push(JSON.parse(JSON.stringify({ before: prior, decision })));
+  candidate.manualReviewHistory = history;
+  candidate.manualReview = decision;
+  candidate.verdict = verdict; candidate.rejectReason = reason;
+  if (verdict === 'reject') candidate.rejectedAt = at; else delete candidate.rejectedAt;
+  candidate.flags = (candidate.flags || []).filter(flag => flag !== 'prior_area_rejection_retained');
+  if (source === 'area' && !candidate.flags.includes('inside_rejected_area')) candidate.flags.unshift('inside_rejected_area');
+}
+
+// A fresh scan must not inherit an older scan's completeness or erase a review.
+function replaceMissionCandidateEvidence(existing, candidate) {
+  const history = Array.isArray(existing.terrainReviewHistory) ? existing.terrainReviewHistory.slice() : [];
+  const manualHistory = Array.isArray(existing.manualReviewHistory) ? existing.manualReviewHistory.slice() : null;
+  const { terrainReviewHistory: priorHistory, ...priorRecord } = existing;
+  history.push(JSON.parse(JSON.stringify(priorRecord)));
+  const reviewed = existing.verdict === 'reject' || existing.rejectedAt
+    || (candidate.verdict !== 'reject' && (existing.manualReview
+      || (existing.verdict === 'sideline' && existing.rejectReason)));
+  const savedReview = reviewed ? {
+    verdict: existing.verdict, rejectReason: existing.rejectReason || candidate.rejectReason,
+    rejectedAt: existing.rejectedAt || candidate.rejectedAt, manualReview: existing.manualReview,
+  } : {};
+  const terrainReviewStatus = ['complete', 'data_review'].includes(candidate.terrainReviewStatus)
+    ? candidate.terrainReviewStatus : 'unknown';
+  Object.assign(existing, candidate, { id: existing.id, terrainReviewStatus, terrainReviewHistory: history }, savedReview);
+  if (manualHistory) existing.manualReviewHistory = manualHistory;
+  if (!reviewed && candidate.verdict === 'reject' && candidate.flags?.includes('inside_rejected_area')) {
+    const before = { verdict: priorRecord.verdict, reason: priorRecord.rejectReason, rejectedAt: priorRecord.rejectedAt,
+      position: { lat: priorRecord.lat, lng: priorRecord.lng }, flags: priorRecord.flags, manualReview: priorRecord.manualReview };
+    const decision = { verdict: 'reject', reason: candidate.rejectReason, at: candidate.rejectedAt || new Date().toISOString(),
+      source: 'scan_exclusion', automated: true, position: { lat: candidate.lat, lng: candidate.lng },
+      ...(candidate.manualReview?.source === 'scan_exclusion' ? {
+        exclusionId: candidate.manualReview.exclusionId, exclusionCreatedAt: candidate.manualReview.exclusionCreatedAt } : {}) };
+    existing.manualReviewHistory = [...(manualHistory || []), JSON.parse(JSON.stringify({ before, decision }))];
+    existing.manualReview = decision;
+  }
+  existing.flags = Array.isArray(existing.flags) ? [...existing.flags] : [];
+  const positionChanged = existing.lat !== priorRecord.lat || existing.lng !== priorRecord.lng;
+  if (positionChanged) {
+    // The full old match and query remain in the detached evidence snapshot.
+    delete existing.landCheck;
+    missionParcelGeometry.delete(existing.id);
+    existing.flags = existing.flags.filter(flag => flag !== 'public_land_requires_permission');
+    if (!existing.flags.includes('parcel_status_unknown')) existing.flags.push('parcel_status_unknown');
+  }
+  if (savedReview.verdict === 'reject' && !existing.flags.includes('inside_rejected_area')) {
+    const currentManualDecision = priorRecord.manualReview?.source === 'candidate'
+      && priorRecord.manualReview.verdict === priorRecord.verdict
+      && priorRecord.manualReview.reason === priorRecord.rejectReason;
+    const priorAreaRejection = !currentManualDecision && priorRecord.flags?.includes('inside_rejected_area');
+    const retainedAreaRejection = !currentManualDecision && priorRecord.flags?.includes('prior_area_rejection_retained');
+    const flag = priorAreaRejection && !positionChanged ? 'inside_rejected_area'
+      : priorAreaRejection || retainedAreaRejection ? 'prior_area_rejection_retained' : null;
+    if (flag && !existing.flags.includes(flag)) existing.flags.unshift(flag);
+  }
+  refreshMissionLandFit(existing);
+  if (existing.landCheck?.status === 'matched' && firstMissionParcel(existing.landCheck)) {
+    existing.flags = existing.flags.filter(flag => flag !== 'parcel_status_unknown' && flag !== 'public_land_requires_permission');
+    if (existing.landCheck.landPath === 'permit_path' && !existing.flags.includes('public_land_requires_permission'))
+      existing.flags.push('public_land_requires_permission');
+  } else if (existing.landCheck?.status === 'matched') {
+    existing.flags = existing.flags.filter(flag => flag !== 'public_land_requires_permission');
+    if (!existing.flags.includes('parcel_status_unknown')) existing.flags.push('parcel_status_unknown');
+  }
+  return existing;
+}
+
+// Re-score existing source facts against the latest terrain without redating the source.
+function refreshMissionLandFit(candidate) {
+  const land = candidate.landCheck;
+  if (!land) return;
+  if (land.status === 'matched' && !firstMissionParcel(land)) {
+    land.fitStatus = 'incomplete_parcel_evidence';
+    return;
+  }
+  if (!Number.isFinite(candidate.score)) return;
+  if (land.status === 'matched') {
+    Object.assign(land, scoreLandFit(candidate, land), { fitUpdatedAt: new Date().toISOString() });
+    delete land.fitStatus;
+  } else if (['no_parcel_at_point', 'unsupported_jurisdiction', 'error'].includes(land.status)) {
+    land.combinedScore = Math.round(candidate.score * .75);
+    land.fitUpdatedAt = new Date().toISOString();
+  }
+}
+
+function missionReviewSummary(candidate) {
+  const retained = candidate.verdict === 'reject'
+    && candidate.flags?.includes('prior_area_rejection_retained')
+    && !candidate.flags.includes('inside_rejected_area');
+  if (retained) return 'Rejection retained from an earlier location' + (candidate.rejectReason ? ': ' + candidate.rejectReason : '.');
+  return candidate.rejectReason || '';
+}
+
+// Describe stored evidence without assigning an uncalibrated probability.
+// Older confidence fields remain in saved records unchanged.
+function missionEvidenceSummary(candidate) {
+  const count = candidate.qualifyingSamples;
+  const samples = Number.isInteger(count) && count >= 0
+    ? `${count} qualifying terrain sample${count === 1 ? "" : "s"}` : 'Terrain sample count unknown';
+  const incomplete = candidate.terrainReviewStatus === 'data_review'
+    || (Array.isArray(candidate.flags) && candidate.flags.includes('terrain_coverage_incomplete'));
+  const coverage = incomplete ? 'terrain data incomplete'
+    : candidate.terrainReviewStatus === 'complete' ? 'bounded terrain screen complete'
+    : 'terrain completeness unknown';
+  const route = candidate.catAccess;
+  const modeled = route && Number.isFinite(route.distanceKm) && route.distanceKm > 0
+    && Number.isFinite(route.maxSlopeDeg) && route.maxSlopeDeg >= 0;
+  return `${samples} · ${coverage} · ${modeled ? 'cat route modeled' : 'cat route not established'} · legal access unverified`;
+}
+
+function renderMissionStatus() {
+  if (!reconMission) return;
+  const active = reconMission.cells.filter(c => c.status === 'running').map(c => `${c.agent}: ${c.id}`).join(' · ');
+  const purchaseLeads = reconMission.candidates.filter(c => currentMissionLandFit(c)?.landPath === 'purchase_lead').length;
+  const persistence = missionPersistence.unsaved ? 'changes unsaved' : 'saved locally';
+  const status = reconMission.status === 'complete'
+    ? `Complete · ${reconMission.name} · ${reconMission.candidates.length} terrain leads · ${purchaseLeads} private purchase leads${missionPersistence.unsaved ? ' · changes unsaved' : ''}`
+    : reconMission.status === 'stopped' ? (missionRunning
+      ? `Stopping workers after current analysis…${missionPersistence.unsaved ? ' · changes unsaved' : ''}`
+      : `Stopped · retained results · ${persistence}`)
+    : missionPaused || reconMission.status === 'paused' ? `Paused · progress · ${persistence}`
+    : (active || 'Workers preparing next cells…') + (missionPersistence.unsaved ? ' · changes unsaved' : '');
+  document.getElementById('missionStatus').textContent = status;
 }
 
 function renderMissionCockpit() {
@@ -2577,29 +3022,25 @@ function renderMissionCockpit() {
   document.getElementById('missionCells').textContent = `${terminal}/${total}`;
   document.getElementById('missionLeads').textContent = reconMission.candidates.length;
   const rejectedCandidates = reconMission.candidates.filter(c => c.verdict === 'reject').length;
-  document.getElementById('missionLand').textContent = reconMission.candidates.filter(c => c.landCheck?.status === 'matched').length;
+  document.getElementById('missionLand').textContent = reconMission.candidates.filter(c => c.landCheck?.status === 'matched' && firstMissionParcel(c.landCheck)).length;
   document.getElementById('missionRejected').textContent = reconMission.rejected + rejectedCandidates;
   document.getElementById('missionErrors').textContent = reconMission.errors;
-  const active = reconMission.cells.filter(c => c.status === 'running').map(c => `${c.agent}: ${c.id}`).join(' · ');
-  const purchaseLeads = reconMission.candidates.filter(c => c.landCheck?.landPath === 'purchase_lead').length;
-  document.getElementById('missionStatus').textContent = reconMission.status === 'complete'
-    ? `Complete · ${reconMission.name} · ${reconMission.candidates.length} terrain leads · ${purchaseLeads} private purchase leads`
-    : missionPaused ? 'Paused · progress saved locally' : active || 'Workers preparing next cells…';
+  renderMissionStatus();
   const reports = document.getElementById('missionReports');
   reports.innerHTML = reconMission.candidates.slice(0, 30).map((c, i) => {
-    const land = c.landCheck, parcel = land?.parcels?.[0];
-    const landColor = land?.landPath === 'purchase_lead' ? 'var(--green)' : land?.landPath === 'permit_path' ? 'var(--orange)' : 'var(--cyan)';
+    const land = c.landCheck, fit = currentMissionLandFit(c), parcel = firstMissionParcel(land);
+    const landColor = fit?.landPath === 'purchase_lead' ? 'var(--green)' : fit?.landPath === 'permit_path' ? 'var(--orange)' : 'var(--cyan)';
     const owner = parcel?.ownerName ? escapeLandText(parcel.ownerName) : null;
     const parcelId = parcel?.parcelId ? escapeLandText(parcel.parcelId) : null;
     const source = land?.provider?.name ? escapeLandText(land.provider.name) : null;
-    const legal = land?.status === 'matched'
+    const legal = land?.status === 'matched' && parcel
       ? `<div style="font-size:8px;color:${landColor};margin-top:5px"><b>${escapeLandText(landCheckLabel(c))}</b>${owner ? ` · ${owner}` : ''}${parcelId ? `<br>Parcel ${parcelId}` : ''}</div><div style="font-size:8px;color:var(--dim);margin-top:2px">${source || 'Official parcel source'} · boundary/owner screening only · title, sale availability, easements and legal cat access unverified</div>`
       : `<div style="font-size:8px;color:var(--dim);margin-top:5px">${escapeLandText(landCheckLabel(c))}</div>`;
-    const score = land?.combinedScore == null ? `<span class="badge b-purple" title="Terrain and verified physical access score">${c.score}</span>` : `<span class="badge b-purple" title="Terrain + physical access + parcel screening">FIT ${land.combinedScore}</span>`;
+    const score = fit?.combinedScore == null ? `<span class="badge b-purple" title="Terrain and verified physical access score">${c.score}</span>` : `<span class="badge b-purple" title="Terrain + physical access + parcel screening">FIT ${fit.combinedScore}</span>`;
     return `<div class="mission-card" onclick="map.flyTo([${c.lat},${c.lng}],13)">
       <div style="display:flex;align-items:center;gap:5px"><b style="font-size:10px;color:#fff">#${i+1} ${c.lat.toFixed(4)}, ${c.lng.toFixed(4)}</b><span style="flex:1"></span><span class="mission-badge" style="color:${c.verdict==='advance'?'var(--green)':c.verdict==='reject'?'var(--red)':'var(--orange)'}">${c.verdict}</span>${score}</div>
       <div class="run-metrics"><span class="run-metric" style="color:var(--green)">${c.verticalM}m vert</span><span class="run-metric" style="color:var(--cyan)">${c.clusterSpanM}m cluster span*</span><span class="run-metric" style="color:var(--accent)">${c.aspect}</span><span class="run-metric" style="color:var(--orange)">${c.catAccess ? 'Access '+(c.catAccess.grade||'?')+' · '+c.catAccess.distanceKm+'km / '+c.catAccess.maxSlopeDeg+'°' : 'Access U · unverified'}</span></div>
-      ${legal}${c.rejectReason ? `<div style="font-size:8px;color:${c.verdict==='reject'?'var(--red)':'var(--orange)'};margin-top:4px">${escapeHtml(c.rejectReason)}</div>` : ''}<div style="display:flex;align-items:center;gap:4px;margin-top:5px"><span style="font-size:8px;color:var(--dim);flex:1">Confidence ${Math.round(c.confidence*100)}% · ${c.agent} · ${c.flags.length} open checks</span><button class="btn" onclick="event.stopPropagation();checkMissionCandidateLand('${c.id}')" style="font-size:8px;color:var(--cyan)">${land ? 'Recheck land' : 'Check land'}</button><button class="btn" onclick="sidelineMissionCandidate(event,'${c.id}')" style="font-size:8px;color:var(--orange)">Sideline</button><button class="btn" onclick="rejectMissionCandidate(event,'${c.id}')" style="font-size:8px;color:var(--red)">Reject</button></div></div>`;
+      ${legal}${missionReviewSummary(c) ? `<div style="font-size:11px;line-height:1.5;color:${c.verdict==='reject'?'var(--red)':'var(--orange)'};margin-top:4px">${escapeHtml(missionReviewSummary(c))}</div>` : ''}<div style="font-size:10px;line-height:1.5;color:var(--dim);margin-top:5px">${escapeHtml(missionEvidenceSummary(c))}</div><div style="display:flex;align-items:center;gap:4px;margin-top:5px"><span style="font-size:8px;color:var(--dim);flex:1">${c.agent} · ${c.flags.length} open checks</span><button class="btn" onclick="event.stopPropagation();checkMissionCandidateLand('${c.id}')" style="font-size:8px;color:var(--cyan)">${land ? 'Recheck land' : 'Check land'}</button><button class="btn" onclick="sidelineMissionCandidate(event,'${c.id}')" style="font-size:8px;color:var(--orange)">Sideline</button><button class="btn" onclick="rejectMissionCandidate(event,'${c.id}')" style="font-size:8px;color:var(--red)">Reject</button></div></div>`;
   }).join('') || '<div style="font-size:9px;color:var(--dim);padding:6px">No leads yet. Workers report here as cells finish.</div>';
 }
 
@@ -2621,12 +3062,12 @@ function drawMissionCandidates() {
     L.circleMarker([c.lat, c.lng], { radius: 6, color, weight: 2, fillColor: color, fillOpacity: .35 })
       .bindPopup(`<b>Recon lead #${i+1}</b><br>${c.verticalM}m vert · ${c.aspect}<br>${c.catAccess ? 'Access '+(c.catAccess.grade||'?')+' · '+c.catAccess.distanceKm+'km cat route' : 'Access U · unverified'}<br><small>${c.flags.length} open checks</small>`)
       .addTo(missionLayer);
-    const geometries = missionParcelGeometry.get(c.id) || [];
+    const parcel = c.landCheck?.status === 'matched' ? firstMissionParcel(c.landCheck) : null;
+    const geometries = parcel ? missionParcelGeometry.get(c.id) || [] : [];
     geometries.forEach(geometry => {
-      const parcel = c.landCheck?.parcels?.[0] || {};
       const fill = parcel.ownershipClass === 'private' ? '#06b6d4' : parcel.ownershipClass === 'public' ? '#ef4444' : '#94a3b8';
       L.geoJSON({ type: 'Feature', geometry, properties: {} }, { style: { color: '#67e8f9', weight: 3, fillColor: fill, fillOpacity: .18, dashArray: '5 3' } })
-        .bindPopup(`<b>Official mapped parcel</b><br>${escapeLandText(parcel.ownerName || 'Owner unavailable')}<br>${parcel.acres == null ? 'Acreage unavailable' : parcel.acres.toFixed(1)+' acres'}<br><small>${escapeLandText(c.landCheck?.provider?.name || '')}<br>Not proof of title, availability or legal access.</small>`)
+        .bindPopup(`<b>Official mapped parcel</b><br>${escapeLandText(parcel.ownerName || 'Owner unavailable')}<br>${Number.isFinite(parcel.acres) && parcel.acres >= 0 ? parcel.acres.toFixed(1)+' acres' : 'Acreage unavailable'}<br><small>${escapeLandText(c.landCheck?.provider?.name || '')}<br>Not proof of title, availability or legal access.</small>`)
         .addTo(missionParcelLayer);
     });
   });

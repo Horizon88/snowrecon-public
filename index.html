@@ -2159,6 +2159,8 @@ let missionLandBatch = null;
 let missionActiveRaw = null;
 let missionExportedArchives = null;
 let missionExportedActive = null;
+// Persistence is independent of whether research is running, stopped or complete.
+let missionPersistence = { unsaved: false, archiveWarning: '', notice: '' };
 
 function escapeLandText(value) {
   return String(value == null ? '' : value).replace(/[&<>'"]/g, ch => ({
@@ -2447,24 +2449,38 @@ function saveReconMission() {
   try {
     localStorage.setItem(MISSION_KEY, JSON.stringify(reconMission));
     missionActiveRaw = null;
-    document.getElementById('missionStorageWarning').style.display = 'none';
+    missionPersistence.unsaved = false;
+    missionPersistence.notice = '';
+    renderMissionStorageWarning();
+    renderMissionStatus();
     return true;
   } catch (_) {
+    missionPersistence.unsaved = true;
     missionStopRequested = true;
-    reconMission.status = 'stopped';
+    if (missionRunning) reconMission.status = 'stopped';
     // Keep missionRunning true until actual workers settle; never permit a
     // replacement while a pending result can still update this mission.
     resetMissionLandBatch();
     document.getElementById('missionPauseBtn').disabled = true;
-    showMissionStorageWarning('Changes are unsaved: browser storage could not save this mission. Results remain in memory and previously stored bytes are unchanged. Export History, open the saved file, then remove exported archives to free space and retry.');
+    renderMissionStorageWarning();
+    renderMissionStatus();
+    log('Mission changes are unsaved; browser storage could not save them. Previously stored bytes are unchanged.', 'warn');
     return false;
   }
 }
 
-function showMissionStorageWarning(message) {
+function renderMissionStorageWarning() {
+  const messages = [missionPersistence.unsaved
+    ? 'Changes are unsaved: results remain in memory and previously stored bytes are unchanged. Export History before leaving this page; free storage and retry saving.' : '',
+    missionPersistence.archiveWarning, missionPersistence.notice].filter(Boolean);
   const warning = document.getElementById('missionStorageWarning');
-  warning.textContent = message;
-  warning.style.display = 'block';
+  warning.textContent = messages.join(' ');
+  warning.style.display = messages.length ? 'block' : 'none';
+}
+
+function showMissionStorageWarning(message) {
+  missionPersistence.notice = message;
+  renderMissionStorageWarning();
   log(message, 'warn');
 }
 
@@ -2492,7 +2508,9 @@ function showMissionHistoryError() {
   const message = 'Could not save mission history; existing results are retained. Export History, open the saved file, then remove exported archives to free space and retry.';
   document.getElementById('missionPanel').style.display = 'block';
   document.getElementById('missionStatus').textContent = message;
-  showMissionStorageWarning(message);
+  missionPersistence.archiveWarning = message;
+  renderMissionStorageWarning();
+  log(message, 'warn');
 }
 
 function archiveReconMission(reason) {
@@ -2502,7 +2520,11 @@ function archiveReconMission(reason) {
     const snapshot = reconMission ? JSON.stringify(reconMission) : null;
     // Separate immutable keys retain old records, including unreadable ACTIVE.
     if (readMissionHistory().archived.some(entry => snapshot !== null
-      ? JSON.stringify(entry.mission) === snapshot : entry.activeRaw === activeRaw)) return true;
+      ? JSON.stringify(entry.mission) === snapshot : entry.activeRaw === activeRaw)) {
+      missionPersistence.archiveWarning = '';
+      renderMissionStorageWarning();
+      return true;
+    }
     const suffix = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
     const key = MISSION_KEY + ':history:' + suffix;
     if (localStorage.getItem(key) != null) throw new Error('History key collision');
@@ -2510,10 +2532,14 @@ function archiveReconMission(reason) {
       ...(snapshot !== null ? { mission: JSON.parse(snapshot) } : { activeRaw }) });
     localStorage.setItem(key, raw);
     if (localStorage.getItem(key) !== raw) throw new Error('History write was not retained');
+    missionPersistence.archiveWarning = '';
+    renderMissionStorageWarning();
     return true;
   } catch (_) {
     showMissionHistoryError();
-    return confirmExportedMissionFallback();
+    const proceed = confirmExportedMissionFallback();
+    if (proceed) { missionPersistence.archiveWarning = ''; renderMissionStorageWarning(); }
+    return proceed;
   }
 }
 
@@ -2797,7 +2823,8 @@ function clearReconMission() {
   try { localStorage.removeItem(MISSION_KEY); }
   catch (_) { showMissionStorageWarning('Could not remove the active mission. Its saved bytes and history are retained; retry Clear.'); return; }
   missionActiveRaw = null;
-  document.getElementById('missionStorageWarning').style.display = 'none';
+  missionPersistence = { unsaved: false, archiveWarning: '', notice: '' };
+  renderMissionStorageWarning();
   resetMissionLandBatch();
   missionStopRequested = true; missionRunning = false; missionPaused = false;
   reconMission = null;
@@ -2969,6 +2996,21 @@ function missionEvidenceSummary(candidate) {
   return `${samples} · ${coverage} · ${modeled ? 'cat route modeled' : 'cat route not established'} · legal access unverified`;
 }
 
+function renderMissionStatus() {
+  if (!reconMission) return;
+  const active = reconMission.cells.filter(c => c.status === 'running').map(c => `${c.agent}: ${c.id}`).join(' · ');
+  const purchaseLeads = reconMission.candidates.filter(c => currentMissionLandFit(c)?.landPath === 'purchase_lead').length;
+  const persistence = missionPersistence.unsaved ? 'changes unsaved' : 'saved locally';
+  const status = reconMission.status === 'complete'
+    ? `Complete · ${reconMission.name} · ${reconMission.candidates.length} terrain leads · ${purchaseLeads} private purchase leads${missionPersistence.unsaved ? ' · changes unsaved' : ''}`
+    : reconMission.status === 'stopped' ? (missionRunning
+      ? `Stopping workers after current analysis…${missionPersistence.unsaved ? ' · changes unsaved' : ''}`
+      : `Stopped · retained results · ${persistence}`)
+    : missionPaused || reconMission.status === 'paused' ? `Paused · progress · ${persistence}`
+    : (active || 'Workers preparing next cells…') + (missionPersistence.unsaved ? ' · changes unsaved' : '');
+  document.getElementById('missionStatus').textContent = status;
+}
+
 function renderMissionCockpit() {
   if (!reconMission) return;
   const terminal = reconMission.cells.filter(c => ['complete','rejected','error'].includes(c.status)).length;
@@ -2980,12 +3022,7 @@ function renderMissionCockpit() {
   document.getElementById('missionLand').textContent = reconMission.candidates.filter(c => c.landCheck?.status === 'matched' && firstMissionParcel(c.landCheck)).length;
   document.getElementById('missionRejected').textContent = reconMission.rejected + rejectedCandidates;
   document.getElementById('missionErrors').textContent = reconMission.errors;
-  const active = reconMission.cells.filter(c => c.status === 'running').map(c => `${c.agent}: ${c.id}`).join(' · ');
-  const purchaseLeads = reconMission.candidates.filter(c => currentMissionLandFit(c)?.landPath === 'purchase_lead').length;
-  document.getElementById('missionStatus').textContent = reconMission.status === 'complete'
-    ? `Complete · ${reconMission.name} · ${reconMission.candidates.length} terrain leads · ${purchaseLeads} private purchase leads`
-    : reconMission.status === 'stopped' ? (missionRunning ? 'Stopping workers after current analysis…' : 'Stopped · retained results saved locally')
-    : missionPaused ? 'Paused · progress saved locally' : active || 'Workers preparing next cells…';
+  renderMissionStatus();
   const reports = document.getElementById('missionReports');
   reports.innerHTML = reconMission.candidates.slice(0, 30).map((c, i) => {
     const land = c.landCheck, fit = currentMissionLandFit(c), parcel = firstMissionParcel(land);

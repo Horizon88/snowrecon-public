@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import vm from 'node:vm';
 const html = fs.readFileSync(new URL('../index.html', import.meta.url), 'utf8');
 const elements = new Map();
-const context = vm.createContext({missionParcelGeometry: new Map(), missionPaused: false,
+const context = vm.createContext({missionPersistence:{unsaved:false,archiveWarning:'',notice:''},missionParcelGeometry: new Map(), missionPaused: false,
   document: {getElementById: id => {if (!elements.has(id)) elements.set(id, {style: {}, innerHTML: ''}); return elements.get(id);}}});
 const start = html.indexOf('function replaceMissionCandidateEvidence(');
 const end = html.indexOf('\nfunction drawMissionCandidates()', start);

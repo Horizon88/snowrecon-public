@@ -16,7 +16,7 @@ function setup(candidates,fetcher=()=>{throw Error('unexpected fetch');}) {
   const layer=()=>({clearLayers(){}});
   const shape=(type,args)=>{const record={type,args};shapes.push(record);return{
     bindPopup(popup){record.popup=popup;return this;},addTo(){return this;}};};
-  const context=vm.createContext({MISSION_KEY:'mission',reconMission:null,missionActiveRaw:null,missionExportedArchives:null,missionExportedActive:null,missionStopRequested:false,missionPaused:false,missionRunning:false,missionParcelGeometry:new Map(),missionLandRequests:new WeakMap(),missionLandBatch:null,
+  const context=vm.createContext({missionPersistence:{unsaved:false,archiveWarning:'',notice:''},MISSION_KEY:'mission',reconMission:null,missionActiveRaw:null,missionExportedArchives:null,missionExportedActive:null,missionStopRequested:false,missionPaused:false,missionRunning:false,missionParcelGeometry:new Map(),missionLandRequests:new WeakMap(),missionLandBatch:null,
     Blob,URL:{createObjectURL:()=> 'blob:test',revokeObjectURL(){}},setTimeout:()=>{},confirm:()=>false,
     document:{createElement:()=>({click(){}}),getElementById:id=>{if(!elements.has(id))elements.set(id,{style:{},innerHTML:'',textContent:''});return elements.get(id);}},
     localStorage:{get length(){return stored.size;},key:i=>[...stored.keys()][i]??null,getItem:key=>stored.get(key),setItem:(key,value)=>{stored.set(key,value);saves.push(JSON.parse(value));},removeItem:key=>stored.delete(key)},
@@ -611,4 +611,72 @@ for(const change of ['ram','stored','raw','failed-export'])test(`export-only arc
   const before=s.stored.get('mission'),live=s.context.reconMission;let confirmations=0;s.context.confirm=()=>{confirmations++;return true;};
   s.context.localStorage.setItem=()=>{throw Error('quota');};s.context.clearReconMission();
   assert.equal(confirmations,0);assert.equal(s.stored.get('mission'),before);assert.equal(s.context.reconMission,live);assert.equal(archived(s).length,0);
+});
+
+test('completed manual rejection stays complete on save failure and the next launch archives it before replacement',async()=>{
+  const s=setup([lead('reviewed',{manualReviewHistory:[{decision:{reason:'Earlier review'}}]})]);s.load();
+  vm.runInContext(html.slice(html.indexOf('function rejectMissionCandidate('),html.indexOf('function replaceMissionCandidateEvidence(')),s.context);
+  s.context.prompt=()=> 'Fresh retained rejection';const before=s.stored.get('mission'),set=s.context.localStorage.setItem;
+  s.context.localStorage.setItem=()=>{throw Error('quota');};
+  s.context.rejectMissionCandidate({stopPropagation(){}},'reviewed');
+  assert.equal(s.context.reconMission.status,'complete');assert.equal(s.context.missionPersistence.unsaved,true);
+  assert.equal(s.stored.get('mission'),before);assert.equal(s.context.reconMission.candidates[0].manualReviewHistory.length,2);
+  assert.match(s.elements.get('missionStatus').textContent,/^Complete.*changes unsaved/);
+  const old=clone(s.context.reconMission);s.context.localStorage.setItem=set;const finish=installLaunch(s),launch=s.context.launchReconMission();
+  assert.notEqual(s.context.reconMission.id,old.id);assert.deepEqual(archived(s)[0].mission,old);assert.equal(archived(s)[0].mission.status,'complete');
+  finish();await launch;assert.equal(s.context.missionPersistence.unsaved,false);
+});
+
+for(const status of ['paused','stopped'])test(`idle ${status} save failure retains lifecycle and never claims unsaved results are locally saved`,()=>{
+  const s=setup([lead('kept')]);s.load();s.context.reconMission.status=status;
+  s.context.localStorage.setItem=()=>{throw Error('quota');};const before=s.stored.get('mission');
+  assert.equal(s.context.saveReconMission(),false);assert.equal(s.context.reconMission.status,status);
+  assert.match(s.elements.get('missionStatus').textContent,/changes unsaved/);assert.doesNotMatch(s.elements.get('missionStatus').textContent,/saved locally/);
+  assert.equal(s.stored.get('mission'),before);s.context.renderMissionCockpit();assert.match(s.elements.get('missionStatus').textContent,/changes unsaved/);
+});
+
+test('a completed mission loaded during storage failure keeps complete controls and an unsaved indication',()=>{
+  const s=setup([lead('loaded',{manualReviewHistory:[{decision:{reason:'Preserved'}}]})]);const before=s.stored.get('mission');
+  s.context.localStorage.setItem=()=>{throw Error('quota');};s.load();
+  assert.equal(s.context.reconMission.status,'complete');assert.equal(s.elements.get('missionLaunchBtn').textContent,'Mission Complete');
+  assert.match(s.elements.get('missionStatus').textContent,/^Complete.*changes unsaved/);assert.equal(s.stored.get('mission'),before);
+  assert.equal(s.context.reconMission.candidates[0].manualReviewHistory[0].decision.reason,'Preserved');
+});
+
+test('final launch save failure cannot turn completed work into stopped or contradict the launch button',async()=>{
+  const s=setup([]);s.load();const finish=installLaunch(s),launch=s.context.launchReconMission();const before=s.stored.get('mission'),set=s.context.localStorage.setItem;
+  s.context.localStorage.setItem=()=>{throw Error('final save quota');};finish();await launch;
+  assert.equal(s.context.reconMission.status,'complete');assert.equal(s.context.missionRunning,false);
+  assert.equal(s.elements.get('missionLaunchBtn').textContent,'Mission Complete');assert.equal(s.elements.get('missionLaunchBtn').disabled,false);
+  assert.match(s.elements.get('missionStatus').textContent,/^Complete.*changes unsaved/);assert.equal(s.stored.get('mission'),before);
+  assert.equal(s.elements.get('missionStorageWarning').style.display,'block');
+  s.context.localStorage.setItem=set;s.context.saveReconMission();
+  assert.equal(s.saved().status,'complete');assert.equal(s.context.missionPersistence.unsaved,false);
+  assert.doesNotMatch(s.elements.get('missionStatus').textContent,/unsaved/);assert.equal(s.elements.get('missionStorageWarning').style.display,'none');
+  assert.ok(!s.stored.get('mission').includes('missionPersistence'));
+});
+
+test('transient export and archive notices cannot overwrite a persistent unsaved warning',()=>{
+  const s=setup([lead('retained')]);s.load();const set=s.context.localStorage.setItem;
+  s.context.reconMission.candidates[0].rejectReason='Not saved';s.context.localStorage.setItem=()=>{throw Error('quota');};s.context.saveReconMission();
+  s.context.removeExportedMissionArchives();
+  assert.match(s.elements.get('missionStorageWarning').textContent,/Changes are unsaved.*Export History first/);
+  s.context.URL.createObjectURL=()=>{throw Error('export failed');};s.context.exportMissionHistory();
+  assert.match(s.elements.get('missionStorageWarning').textContent,/Changes are unsaved.*could not be exported/);
+  s.context.showMissionStorageWarning('Unrelated storage notice');s.context.renderMissionCockpit();
+  assert.match(s.elements.get('missionStorageWarning').textContent,/Changes are unsaved.*Unrelated storage notice/);
+  assert.match(s.elements.get('missionStatus').textContent,/changes unsaved/);
+  s.context.localStorage.setItem=set;s.context.saveReconMission();assert.equal(s.elements.get('missionStorageWarning').style.display,'none');
+});
+
+test('successful ACTIVE save clears unsaved state while an archive failure remains visible until archive recovery',()=>{
+  const s=setup([lead('retained')]);s.load();const set=s.context.localStorage.setItem;
+  s.context.localStorage.setItem=()=>{throw Error('quota');};s.context.saveReconMission();
+  assert.equal(s.context.archiveReconMission('failed'),false);assert.match(s.elements.get('missionStorageWarning').textContent,/Changes are unsaved.*Could not save mission history/);
+  s.context.localStorage.setItem=set;assert.equal(s.context.saveReconMission(),true);
+  assert.equal(s.context.missionPersistence.unsaved,false);assert.doesNotMatch(s.elements.get('missionStorageWarning').textContent,/Changes are unsaved/);
+  assert.match(s.elements.get('missionStorageWarning').textContent,/Could not save mission history/);assert.equal(s.elements.get('missionStorageWarning').style.display,'block');
+  s.context.showMissionStorageWarning('Additional notice');assert.match(s.elements.get('missionStorageWarning').textContent,/Could not save mission history.*Additional notice/);
+  assert.equal(s.context.archiveReconMission('recovered'),true);assert.doesNotMatch(s.elements.get('missionStorageWarning').textContent,/Could not save mission history/);
+  assert.equal(s.context.reconMission.status,'complete');assert.equal(archived(s)[0].mission.status,'complete');
 });

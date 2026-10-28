@@ -10,7 +10,7 @@ function setup() {
     flags:['inside_rejected_area','legal_access_unverified'],score:40,qualifyingSamples:4,verticalM:200,clusterSpanM:300,aspect:'N',agent:'fixture',catAccess:null,
     manualReview:{verdict:'reject',reason:'Original area',source:'area',at:'2026-10-20T00:00:00Z',exclusionId:'old-area'}};
   const mission={name:'Fixture',status:'complete',cells:[],candidates:[candidate],exclusions:[],errors:0,rejected:0};
-  const context=vm.createContext({reconMission:mission,missionPaused:false,missionParcelGeometry:new Map(),
+  const context=vm.createContext({missionPersistence:{unsaved:false,archiveWarning:'',notice:''},reconMission:mission,missionPaused:false,missionParcelGeometry:new Map(),
     document:{getElementById:id=>{if(!elements.has(id))elements.set(id,{style:{},innerHTML:''});return elements.get(id);}},
     map:{getBounds:()=>({getSouth:()=>45.001,getNorth:()=>45.003,getWest:()=>-112.003,getEast:()=>-112.001})},
     prompt:()=>answers.shift(),alert:message=>{throw Error(message);},saveReconMission:()=>effects.saved++,drawMissionCandidates:()=>effects.drawn++});

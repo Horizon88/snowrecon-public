@@ -2298,6 +2298,7 @@ async function checkMissionCandidateLand(candidateId, options = {}) {
 
 async function performMissionLandCheck(candidate, request, options) {
   const { mission, queryPosition } = request;
+  const bulkOwner = missionLandBatch?.mission === mission ? missionLandBatch : null;
   if (candidate.landCheck && candidate.landCheck.status !== 'checking') {
     candidate.landCheckHistory ||= [];
     candidate.landCheckHistory.push(JSON.parse(JSON.stringify(candidate.landCheck)));
@@ -2352,9 +2353,11 @@ async function performMissionLandCheck(candidate, request, options) {
       parcels: [], score25: 0, combinedScore: Math.round(candidate.score * .75), landPath: 'error', landPathLabel: 'Land check failed' };
   }
   mission.candidates.sort(missionCandidateSort);
-  saveReconMission();
-  // A stopped mission retains current results, even when its bulk UI owner was cancelled.
-  if (!options.silent || mission.status === 'stopped') { renderMissionCockpit(); drawMissionCandidates(); }
+  const saved = saveReconMission();
+  // A cancelled bulk owner will not repaint, including late current results
+  // after storage recovers. The request's identity guards above still apply.
+  if (!saved || !options.silent || mission.status === 'stopped'
+      || (bulkOwner && missionLandBatch !== bulkOwner)) { renderMissionCockpit(); drawMissionCandidates(); }
   return candidate.landCheck;
 }
 

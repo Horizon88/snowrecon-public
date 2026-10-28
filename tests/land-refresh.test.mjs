@@ -7,9 +7,9 @@ const html = fs.readFileSync(new URL('../index.html', import.meta.url), 'utf8');
 function setup(candidate) {
   const requests = [], effects = {saved: 0, rendered: 0, drawn: 0};
   const mission = {candidates: [candidate]};
-  const context = vm.createContext({reconMission: mission, missionParcelGeometry: new Map(), missionLandRequests: new WeakMap(),
+  const context = vm.createContext({reconMission: mission, missionLandBatch: null, missionParcelGeometry: new Map(), missionLandRequests: new WeakMap(),
     fetchOfficialLandParcels: (lat, lng) => new Promise((resolve, reject) => requests.push({lat, lng, resolve, reject})),
-    missionCandidateSort: () => 0, saveReconMission: () => effects.saved++,
+    missionCandidateSort: () => 0, saveReconMission: () => { effects.saved++; return true; },
     renderMissionCockpit: () => effects.rendered++, drawMissionCandidates: () => effects.drawn++});
   const a = html.indexOf('async function checkMissionCandidateLand(');
   const b = html.indexOf('\nasync function checkMissionLand()', a);

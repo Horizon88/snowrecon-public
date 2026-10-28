@@ -680,3 +680,44 @@ test('successful ACTIVE save clears unsaved state while an archive failure remai
   assert.equal(s.context.archiveReconMission('recovered'),true);assert.doesNotMatch(s.elements.get('missionStorageWarning').textContent,/Could not save mission history/);
   assert.equal(s.context.reconMission.status,'complete');assert.equal(archived(s)[0].mission.status,'complete');
 });
+
+for(const status of ['complete','paused'])for(const recover of [false,true])test(`silent bulk ${status} results repaint after quota failure and ${recover?'late storage recovery':'continued failure'}`,async()=>{
+  const deferred=[],candidates=Array.from({length:4},(_,i)=>lead(`quota-${i}`,{lat:45+i/100,
+    manualReviewHistory:[{decision:{reason:`Retained review ${i}`}}]}));
+  const s=setup(candidates,()=>new Promise(resolve=>deferred.push(resolve)));s.load();s.context.reconMission.status=status;s.context.saveReconMission();
+  const before=s.stored.get('mission'),set=s.context.localStorage.setItem;
+  s.context.localStorage.setItem=()=>{throw Error('quota during silent check');};
+  const bulk=s.context.checkMissionLand();assert.equal(s.requests.length,3);
+  const matched=i=>({...response(`current-${i}`),parcels:[{parcelId:`current-${i}`,ownershipClass:'private',acres:40,
+    geometry:{type:'Point',coordinates:[-112,45+i/100]}}]});
+  deferred[0](matched(0));await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(s.context.reconMission.status,status);assert.equal(s.context.missionLandBatch,null);
+  assert.equal(s.context.missionPersistence.unsaved,true);assert.equal(s.stored.get('mission'),before);
+  assert.equal(s.elements.get('missionLand').textContent,1);assert.match(s.output(),/current-0/);
+  assert.ok(s.shapes.some(shape=>shape.type==='geoJSON'&&shape.args[0].geometry.coordinates[1]===45));
+  if(recover)s.context.localStorage.setItem=set;
+  for(const i of [1,2]) {
+    const shapes=s.shapes.length;deferred[i](matched(i));await new Promise(resolve=>setImmediate(resolve));
+    assert.equal(s.elements.get('missionLand').textContent,i+1);assert.match(s.output(),new RegExp(`current-${i}`));
+    assert.ok(s.shapes.slice(shapes).some(shape=>shape.type==='geoJSON'&&shape.args[0].geometry.coordinates[1]===45+i/100));
+  }
+  await bulk;
+  assert.equal(s.requests.length,3);assert.equal(s.context.reconMission.candidates.find(c=>c.id==='quota-3').landCheck,undefined);
+  assert.equal(s.context.reconMission.status,status);assert.equal(s.elements.get('missionLandBtn').disabled,false);
+  assert.equal(s.context.missionPersistence.unsaved,!recover);assert.equal(s.context.missionLandBatch,null);
+  for(const original of candidates)assert.deepEqual(clone(s.context.reconMission.candidates.find(c=>c.id===original.id).manualReviewHistory),original.manualReviewHistory);
+  if(recover)assert.equal(s.saved().candidates.filter(c=>c.landCheck?.status==='matched').length,3);
+  else{assert.equal(s.stored.get('mission'),before);assert.match(s.elements.get('missionStatus').textContent,/changes unsaved/);}
+});
+
+test('cancelled bulk late responses cannot repaint or save a replacement mission after quota failure',async()=>{
+  const deferred=[],s=setup(Array.from({length:4},(_,i)=>lead(`old-${i}`,{lat:45+i/100})),()=>new Promise(resolve=>deferred.push(resolve)));
+  s.load();const set=s.context.localStorage.setItem;s.context.localStorage.setItem=()=>{throw Error('quota');};const bulk=s.context.checkMissionLand();
+  deferred[0](response('retained-before-replacement'));await new Promise(resolve=>setImmediate(resolve));
+  assert.match(s.output(),/retained-before-replacement/);s.context.localStorage.setItem=set;
+  const finish=installLaunch(s),launch=s.context.launchReconMission();const replacement=s.context.reconMission;
+  const before=s.stored.get('mission'),output=s.output(),shapes=s.shapes.length;
+  deferred[1](response('obsolete-late-1'));deferred[2](response('obsolete-late-2'));await bulk;
+  assert.equal(s.context.reconMission,replacement);assert.equal(s.stored.get('mission'),before);assert.equal(s.output(),output);assert.equal(s.shapes.length,shapes);
+  assert.equal(s.requests.length,3);assert.equal(replacement.candidates.length,0);finish();await launch;
+});

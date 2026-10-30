@@ -21,7 +21,7 @@ const RunEngine = (() => {
   function getRegion() { return region; }
 
   function parseDEMText(text) {
-    const arr = new Float32Array(256 * 256);
+    const arr = new Float32Array(256 * 256).fill(NaN);
     const lines = text.trim().split('\n');
     for (let r = 0; r < Math.min(lines.length, 256); r++) {
       const cols = lines[r].split(',');
@@ -1026,7 +1026,8 @@ out body geom;`;
   // ===== ZONE SCANNER (sustained vertical heatmap) =====
   // For each grid point, walk downhill and measure how much vertical
   // you can descend while the terrain stays steep (>= slopeThreshold).
-  // Returns an array of {lat, lng, sustainedVert, aspect, elevation} objects.
+  // Returns { samples, coverage }; coverage describes this bounded sampled screen,
+  // never full parcel coverage or proof that all possible descents were searched.
 
   // Configurable zone scan sensitivity
   let zoneSlopeThreshold = 12; // minimum slope to count as "steep" (default: moderate)
@@ -1049,12 +1050,38 @@ out body geom;`;
     const results = [];
     let processed = 0;
     const total = gridSize * gridSize;
+    const coverage = { scope: 'sampled_grid_and_traces', totalSamples: total,
+      measuredSamples: 0, missingElevationSamples: 0, missingSlopeSamples: 0,
+      incompleteTraces: 0, limitedTraces: 0, unrequestedSamples: 0,
+      unrequestedSlopeSamples: 0, unrequestedTraces: 0, complete: false };
+    const requested = new Set(), incompleteTiles = new Set(), deferredTiles = new Set();
+    const tileKeyAt = (lat,lng) => { const t=latLngToTile(lat,lng,14); return `14/${t.tileX}/${t.tileY}`; };
+    const maxNewTiles = 512; // Per scan, including on-demand trace stencils.
+    async function ensureTiles(keys) {
+      const pending = [...new Set(keys)].filter(key => parsedCache[key] === undefined);
+      for (let i=0;i<pending.length;i+=4) await Promise.all(pending.slice(i,i+4).map(async key => {
+        if (!requested.has(key) && requested.size >= maxNewTiles) { deferredTiles.add(key); return; }
+        requested.add(key); const [z,x,y]=key.split('/').map(Number); await fetchAndParseTile(z,x,y);
+      }));
+    }
+    function missingAt(points) {
+      let unrequested=false, missing=false;
+      for(const [lat,lng] of points) if(!Number.isFinite(getElevationFast(lat,lng))) {
+        const key=tileKeyAt(lat,lng);
+        if(parsedCache[key] === undefined) { unrequested=true; deferredTiles.add(key); }
+        else { missing=true; incompleteTiles.add(key); }
+      }
+      return { unrequested, missing };
+    }
+    // Use actual Web Mercator tile extents, not a longitude approximation.
+    const nw=latLngToTile(bounds.north,bounds.west,14), se=latLngToTile(bounds.south,bounds.east,14);
+    const initialTiles=[];
+    for(let y=Math.max(0,nw.tileY-1);y<=Math.min(16383,se.tileY+1);y++)
+      for(let x=Math.max(0,nw.tileX-1);x<=Math.min(16383,se.tileX+1);x++) initialTiles.push(`14/${x}/${y}`);
+    await ensureTiles(initialTiles);
 
     for (let i = 0; i < gridSize; i++) {
       const rowLat = bounds.south + latStep * (i + 0.5);
-      // Prefetch tiles for this row
-      await prefetchTiles(rowLat, (bounds.east + bounds.west) / 2,
-        Math.max(2, Math.ceil((bounds.east - bounds.west) / 0.044 / 2)));
       await yieldToUI();
 
       for (let j = 0; j < gridSize; j++) {
@@ -1065,10 +1092,22 @@ out body geom;`;
         if (onProgress && processed % 10 === 0) onProgress(processed, total, 'Scanning terrain');
 
         const elev = getElevationFast(lat, lng);
-        if (isNaN(elev) || elev < (options.minElevation ?? 300)) continue;
+        if (!Number.isFinite(elev)) {
+          const gap=missingAt([[lat,lng]]);
+          if(gap.unrequested) coverage.unrequestedSamples++; else coverage.missingElevationSamples++;
+          continue;
+        }
+        if (elev < (options.minElevation ?? 300)) { coverage.measuredSamples++; continue; }
 
         const analysis = analyzeFast(lat, lng, 0.0005);
-        if (!analysis || isNaN(analysis.slope) || analysis.slope < slopeThreshold) continue;
+        if (!analysis || !Number.isFinite(analysis.slope)) {
+          const gap=missingAt([[lat,lng],[lat+.0005,lng],[lat-.0005,lng],[lat,lng+.0005],[lat,lng-.0005]]);
+          if(gap.unrequested) coverage.unrequestedSlopeSamples++;
+          if(gap.missing) coverage.missingSlopeSamples++;
+          continue;
+        }
+        coverage.measuredSamples++;
+        if (analysis.slope < slopeThreshold) continue;
 
         // Walk downhill from this point, counting how much vert we get
         // while the slope stays above threshold
@@ -1079,12 +1118,26 @@ out body geom;`;
         let prevElev = elev;
         let flatStreak = 0;
 
+        let traceFinished = false;
         for (let step = 0; step < maxSteps; step++) {
+          // smoothGradient otherwise ignores missing neighbours. Do not let a
+          // truncated stencil masquerade as a measured end of the descent.
+          const offsets = [[0,0],[1,0],[-1,0],[0,1],[0,-1],
+            [Math.SQRT1_2,Math.SQRT1_2],[Math.SQRT1_2,-Math.SQRT1_2],
+            [-Math.SQRT1_2,Math.SQRT1_2],[-Math.SQRT1_2,-Math.SQRT1_2]];
+          const stencil=offsets.map(([dy,dx])=>[curLat+dy*stepDelta,curLng+dx*stepDelta]);
+          await ensureTiles(stencil.map(([lat,lng])=>tileKeyAt(lat,lng)));
+          const gap=missingAt(stencil);
+          if (gap.unrequested || gap.missing) {
+            if(gap.unrequested) coverage.unrequestedTraces++;
+            if(gap.missing) coverage.incompleteTraces++;
+            traceFinished = true; break;
+          }
           const sg = smoothGradient(curLat, curLng, stepDelta);
-          if (!sg) break;
+          if (!sg) { traceFinished = true; break; }
 
           const a = analyzeFast(curLat, curLng, stepDelta);
-          if (!a || isNaN(a.slope)) break;
+          if (!a || !Number.isFinite(a.slope)) { coverage.incompleteTraces++; traceFinished = true; break; }
 
           if (a.slope >= slopeThreshold) {
             steepVert += Math.max(0, prevElev - a.elevation);
@@ -1095,7 +1148,7 @@ out body geom;`;
             flatStreak = 0;
           } else {
             flatStreak += stepMeters;
-            if (flatStreak > zoneFlatTolerance) break; // too much flat, stop
+            if (flatStreak > zoneFlatTolerance) { traceFinished = true; break; } // measured flat runout
           }
 
           // Step downhill
@@ -1103,7 +1156,9 @@ out body geom;`;
           curLng += (sg.dxNorm * stepMeters) / metersPerDegLng(curLat);
         }
 
-        if (steepVert >= minVerticalDrop * 0.33) { // at least a third of min vert in steep terrain
+        if (!traceFinished) coverage.limitedTraces++;
+
+        if (steepVert >= (options.minVerticalDrop ?? minVerticalDrop) * 0.33) { // at least a third of min vert in steep terrain
           const avgAspect = (Math.atan2(totalAspectSin / steepCount, totalAspectCos / steepCount) * RAD2DEG + 360) % 360;
           results.push({
             lat, lng, elevation: elev,
@@ -1115,7 +1170,39 @@ out body geom;`;
       }
     }
 
-    return results;
+    coverage.complete = coverage.missingElevationSamples === 0 && coverage.missingSlopeSamples === 0
+      && coverage.incompleteTraces === 0 && coverage.limitedTraces === 0
+      && coverage.unrequestedSamples === 0 && coverage.unrequestedSlopeSamples === 0 && coverage.unrequestedTraces === 0;
+    coverage.incompleteTileKeys=[...incompleteTiles].sort();
+    coverage.unrequestedTileKeys=[...deferredTiles].sort();
+    coverage.newTilesRequested=requested.size;
+    return { samples: results, coverage };
+  }
+
+  // Explicit user retry only: invalidate recorded failures, never valid tiles or
+  // the whole cache. A page reload naturally starts with an empty cache.
+  function retryIncompleteDEMTiles(keys) {
+    let cleared=0;
+    for(const key of new Set(keys || [])) {
+      if(typeof key !== 'string' || !/^14\/\d+\/\d+$/.test(key)) continue;
+      const cached=parsedCache[key];
+      if(cached === null || (cached instanceof Float32Array && cached.some(v=>!Number.isFinite(v)))) {
+        delete parsedCache[key]; cleared++;
+      }
+    }
+    return cleared;
+  }
+
+  // Retention and preference are separate. Width remains the existing screen;
+  // these zones are terrain search extents, never cadastral plots.
+  function screenMissionZones(zones, coverage) {
+    const retained = zones.filter(z => z.maxVert >= 150 && z.width >= 200)
+      .map(z => ({ ...z, preferredVertical: z.maxVert >= 250 }))
+      .sort((a,b) => b.maxVert-a.maxVert || b.pointCount-a.pointCount);
+    const incomplete = coverage?.complete !== true;
+    return { zones: retained, status: incomplete ? 'data_review' : retained.length ? 'complete' : 'rejected',
+      reason: incomplete ? 'Elevation coverage or bounded descent analysis is incomplete; retain for data review.'
+        : retained.length ? null : 'No sampled candidate passed 150m vertical / 200m span; 250m is preferred.' };
   }
 
   // Cluster adjacent heatmap points into zones
@@ -1368,6 +1455,8 @@ out body geom;`;
     setZoneSensitivity,
     getZoneSensitivity,
     scanZones,
+    retryIncompleteDEMTiles,
+    screenMissionZones,
     clusterZones,
     scoreZone,
     generateZoneName,

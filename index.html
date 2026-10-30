@@ -2565,9 +2565,12 @@ async function runMissionWorker(agentName) {
         if (!dupe) {
           reconMission.candidates.push(candidate);
           if (!deferResearch && candidate.lat >= 44.35 && candidate.lat <= 49.01 && candidate.lng >= -116.1 && candidate.lng <= -104.0) autoLandChecks.push(candidate.id);
-        // A deferred variant has no fresh access/parcel assessment. Keep the
-        // duplicate intact, including its geometry and any queued land check.
-        } else if (!deferResearch && (candidate.score > dupe.score || (candidate.catAccess && !dupe.catAccess))) {
+        // Keep parcel evidence and any automatic lookup bound to its original
+        // geometry. Top-three records are marked false before either worker can
+        // queue them; only unprocessed, parcel-unbound duplicates may refresh.
+        } else if (!deferResearch && dupe.researchPending !== false && !dupe.landCheck
+          && !missionParcelGeometry.has(dupe.id)
+          && (candidate.score > dupe.score || (candidate.catAccess && !dupe.catAccess))) {
           const reviewed = dupe.verdict === 'reject' || dupe.rejectedAt || dupe.manualReview
             || (dupe.verdict === 'sideline' && dupe.rejectReason);
           const savedReview = reviewed && candidate.verdict !== 'reject' ? { verdict:dupe.verdict, rejectReason:dupe.rejectReason,

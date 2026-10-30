@@ -169,7 +169,7 @@ async function retryHarness({verdict='reject',complete=false,running=false,exclu
     exclusions:[{id:'saved-exclusion'}],rejected:1,errors:0};
   const elements=new Map();const element=id=>{if(!elements.has(id))elements.set(id,{value:id==='missionPreset'?'current':'4',style:{}});return elements.get(id);};
   const actual=engine();let scans=0,cleared;
-  const context=vm.createContext({console,setTimeout,document:{getElementById:element},missionRunning:running,missionPaused:false,missionStopRequested:false,missionStorageFailed:false,currentRegion:'japan',reconMission:mission,
+  const context=vm.createContext({console,setTimeout,document:{getElementById:element},missionRunning:running,missionPaused:false,missionStopRequested:false,missionStorageFailed:false,missionParcelGeometry:new Map(),currentRegion:'japan',reconMission:mission,
     MISSION_PRESETS:{},map:{getCenter:()=>({lat:43,lng:141})},missionCellGrid:()=>{throw Error('Existing mission must not reset');},
     RunEngine:{retryIncompleteDEMTiles:keys=>{cleared=keys;},setZoneSensitivity(){},scanZones:async()=>{scans++;return {samples:[],coverage:{complete,incompleteTileKeys:complete?[]:['14/1/2']}};},clusterZones:()=>[zone],screenMissionZones:actual.screenMissionZones,fetchRoads:async()=>[]},
     renderMissionCockpit(){},saveReconMission(){return true;},drawMissionCandidates(){},missionCandidateSort:()=>0,missionHash:()=> 'new-id',findMissionExclusion:()=>exclusionReason?{reason:exclusionReason}:null,missionDistanceM:()=>0,checkMissionCandidateLand:async()=>{},alert:message=>{throw Error(message);} });

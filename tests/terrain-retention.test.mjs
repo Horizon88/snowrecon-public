@@ -161,11 +161,11 @@ test('explicit retry clears only recorded failed tiles, then recovered source co
   assert.equal(second.coverage.complete,true);assert.equal(second.coverage.newTilesRequested,1);
 });
 
-async function retryHarness({verdict='reject',complete=false,running=false,exclusionReason=null}={}) {
+async function retryHarness({verdict='reject',complete=false,running=false,exclusionReason=null,candidatePatch={}}={}) {
   const zone={maxVert:250,width:200,pointCount:2,maxElev:1000,minElev:750,centroidLat:43,centroidLng:141,aspectDir:'N',points:[{lat:43,lng:141,elevation:1000},{lat:43.002,lng:141,elevation:750}]};
   const mission={id:'saved-mission',status:'complete',cellKm:4,name:'Saved',minElevation:250,
     cells:[{id:'retry',bounds,status:'data_review',attempts:1,coverage:{complete:false,incompleteTileKeys:['14/1/2']}},{id:'prior-rejected',status:'rejected',attempts:1,rejectReason:'prior evidence'}],
-    candidates:[{id:'manual',lat:43,lng:141,verdict,rejectReason:'User decision',score:1,manualReview:{verdict,reason:'User decision'},...(verdict==='reject'?{rejectedAt:'2026-01-01'}:{})}],
+    candidates:[{id:'manual',lat:43,lng:141,verdict,rejectReason:'User decision',score:1,manualReview:{verdict,reason:'User decision'},...(verdict==='reject'?{rejectedAt:'2026-01-01'}:{}),...candidatePatch}],
     exclusions:[{id:'saved-exclusion'}],rejected:1,errors:0};
   const elements=new Map();const element=id=>{if(!elements.has(id))elements.set(id,{value:id==='missionPreset'?'current':'4',style:{}});return elements.get(id);};
   const actual=engine();let scans=0,cleared;
@@ -272,4 +272,30 @@ test('retry and export are separate explicit controls',()=>{
   assert.match(html, /onclick="exportReconMission\(\)"/);
   const launch=html.slice(html.indexOf('async function launchReconMission('),html.indexOf('async function startReconMission('));
   assert.doesNotMatch(launch,/return retryMissionDataReview/);
+});
+
+test('retry refresh: explicit retry updates a persisted processed lead and retains the prior evidence snapshot', async () => {
+  const prior = { researchPending: false, terrainReviewStatus: 'data_review', flags: ['terrain_coverage_incomplete'], verticalM: 150 };
+  const { state, scans } = await retryHarness({ complete: true, candidatePatch: prior });
+  assert.equal(scans, 1); assert.equal(state.cells[0].status, 'complete');
+  assert.equal(state.candidates[0].terrainReviewStatus, 'complete'); assert.equal(state.candidates[0].verticalM, 250);
+  assert.ok(!state.candidates[0].flags.includes('terrain_coverage_incomplete'));
+  assert.equal(state.retryHistory[0].candidates[0].researchPending, false);
+  assert.equal(state.retryHistory[0].candidates[0].terrainReviewStatus, 'data_review');
+  assert.equal(state.candidates[0].verdict, 'reject'); assert.equal(state.candidates[0].rejectReason, 'User decision');
+});
+test('retry refresh: complete equal-score evidence replaces an unbound incomplete review without losing a user sideline', async () => {
+  const prior = { researchPending: false, terrainReviewStatus: 'data_review', flags: ['terrain_coverage_incomplete'], score: 34 };
+  const { state } = await retryHarness({ complete: true, verdict: 'sideline', candidatePatch: prior });
+  assert.equal(state.candidates[0].score, 34); assert.equal(state.candidates[0].terrainReviewStatus, 'complete');
+  assert.ok(!state.candidates[0].flags.includes('terrain_coverage_incomplete'));
+  assert.equal(state.candidates[0].verdict, 'sideline'); assert.equal(state.retryHistory[0].candidates[0].score, 34);
+});
+test('retry refresh: complete retry preserves processed parcel checking geometry and its prior evidence', async () => {
+  const prior = { researchPending: false, terrainReviewStatus: 'data_review', flags: ['terrain_coverage_incomplete'],
+    landCheck: { status: 'checking' }, footprint: [[43.1, 141.1]], lat: 43.1, lng: 141.1 };
+  const { state } = await retryHarness({ complete: true, candidatePatch: prior });
+  assert.equal(state.candidates[0].lat, 43.1); assert.equal(state.candidates[0].lng, 141.1);
+  assert.equal(state.candidates[0].landCheck.status, 'checking'); assert.equal(state.candidates[0].terrainReviewStatus, 'data_review');
+  assert.equal(state.cells[0].status, 'complete'); assert.equal(state.retryHistory[0].candidates[0].lat, 43.1);
 });

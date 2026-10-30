@@ -5,13 +5,13 @@ import vm from 'node:vm';
 
 const html = await readFile(new URL('../index.html', import.meta.url), 'utf8');
 const engineSource = await readFile(new URL('../run-engine.js', import.meta.url), 'utf8');
-const workerSource = html.slice(html.indexOf('async function runMissionWorker('), html.indexOf('function toggleMissionPause('));
+const workerSource = html.slice(html.indexOf('async function startReconMission('), html.indexOf('function toggleMissionPause('));
 const fixtures = () => [500, 400, 350, 260, 200, 150, 149].map((maxVert, i) => ({
   maxVert, width: 200, pointCount: 6, maxElev: 1800, minElev: 1800 - maxVert,
   centroidLat: 46 + i * .02, centroidLng: -112, aspectDir: 'N',
   points: [{ lat: 46 + i * .02, lng: -112, elevation: 1800 }, { lat: 46 + i * .02 + .002, lng: -112, elevation: 1800 - maxVert }],
 }));
-async function run({ roads = true, excludedLat = null, candidates = [], complete = true, zones = fixtures(), routeDistance = 1000, routeSlope = 12, parcelGeometry = new Map(), workerCount = 1 } = {}) {
+async function run({ roads = true, excludedLat = null, candidates = [], complete = true, zones = fixtures(), routeDistance = 1000, routeSlope = 12, parcelGeometry = new Map(), workerCount = 1, region = 'usa', beforeRoute = async () => {}, onLandCheck = async () => {} } = {}) {
   const engineContext = vm.createContext({ fetch() { throw Error('Unexpected network'); }, setTimeout, clearTimeout });
   vm.runInContext(`${engineSource}\nglobalThis.engine = RunEngine;`, engineContext);
   const cells = Array.from({ length: workerCount }, (_, i) => ({ id: `cell-${i}`, bounds: { fixtureIndex: i }, status: 'pending', attempts: 0 }));
@@ -19,20 +19,21 @@ async function run({ roads = true, excludedLat = null, candidates = [], complete
   const state = { cells, candidates, rejected: 0, errors: 0, minElevation: 250 };
   const calls = { scans: 0, road: 0, routes: [], land: [], landTargets: [], saves: [] };
   const context = vm.createContext({ setTimeout, missionStopRequested: false, missionPaused: false,
-    missionStorageFailed: false, currentRegion: 'usa', reconMission: state, missionParcelGeometry: parcelGeometry,
+    missionRunning: false, document: { getElementById: () => ({ style: {} }) },
+    missionStorageFailed: false, currentRegion: region, reconMission: state, missionParcelGeometry: parcelGeometry,
     RunEngine: { setZoneSensitivity() {}, scanZones: async bounds => { calls.scans++; return { samples: bounds.fixtureIndex, coverage: { complete } }; },
       clusterZones: index => Array.isArray(zones[0]) ? zones[index] : zones, screenMissionZones: engineContext.engine.screenMissionZones,
       fetchRoads: async () => { calls.road++; return roads ? [{}] : []; },
-      traceCatRoute: async (lat) => { calls.routes.push(lat); return { reachedTarget: true, distance: routeDistance, maxSlope: routeSlope, points: [{}, {}, {}], elevGain: 400 }; } },
+      traceCatRoute: async (lat) => { calls.routes.push(lat); await beforeRoute(lat); return { reachedTarget: true, distance: routeDistance, maxSlope: routeSlope, points: [{}, {}, {}], elevGain: 400 }; } },
     saveReconMission() { calls.saves.push(JSON.parse(JSON.stringify(state))); return true; },
     renderMissionCockpit() {}, drawMissionCandidates() {}, missionCandidateSort: () => 0,
     missionHash: (lat, lng) => `${lat}:${lng}`,
     findMissionExclusion: (lat) => lat === excludedLat ? { reason: 'preserved exclusion' } : null,
     missionDistanceM: (a, b) => Math.abs(a.lat - b.lat) * 111320,
-    checkMissionCandidateLand: async id => { calls.land.push(id); const candidate = state.candidates.find(c => c.id === id); calls.landTargets.push({ id, lat: candidate.lat, lng: candidate.lng }); },
+    checkMissionCandidateLand: async id => { calls.land.push(id); const candidate = state.candidates.find(c => c.id === id); calls.landTargets.push({ id, lat: candidate.lat, lng: candidate.lng }); await onLandCheck(candidate); },
   });
-  vm.runInContext(workerSource, context); await Promise.all(Array.from({ length: workerCount }, (_, i) => context.runMissionWorker(`fixture-agent-${i}`)));
-  assert.equal(state.errors, 0); return { state, cell, calls };
+  vm.runInContext(workerSource, context); await context.startReconMission(state);
+  assert.equal(state.errors, 0); return { state, cell, calls, context };
 }
 
 test('all six screened zones survive into saved state, including the fourth and 150m lead', async () => {
@@ -180,3 +181,41 @@ for (const researchPending of [true, undefined]) {
     assert.equal(calls.land.filter(id => id === old.id).length, 1);
   });
 }
+
+for (const region of ['usa', 'japan']) {
+  test(`retry refresh: persisted processed unbound lead can refresh outside the parcel adapter in ${region}`, async () => {
+    const zones = fixtures().slice(0, 1);
+    zones[0].centroidLng = -120; zones[0].points.forEach(p => { p.lng = -120; });
+    const old = priorLead({ lng: -120, researchPending: false, terrainReviewStatus: 'data_review',
+      flags: ['terrain_coverage_incomplete'], catAccess: null });
+    const { calls, cell } = await run({ candidates: [old], zones, region });
+    assert.equal(old.lat, zones[0].centroidLat); assert.equal(old.verticalM, 500);
+    assert.equal(old.terrainReviewStatus, 'complete'); assert.ok(!old.flags.includes('terrain_coverage_incomplete'));
+    assert.ok(old.catAccess); assert.equal(cell.status, 'complete'); assert.equal(calls.land.length, 0);
+  });
+}
+test('retry refresh: a checking request retains its geometry while a second worker awaits and discovers a better variant', async () => {
+  const zones = topThreeCollision();
+  let checkingStarted; const checking = new Promise(resolve => { checkingStarted = resolve; });
+  const { state, calls } = await run({ zones: [[zones[0]], [zones[1]]], workerCount: 2,
+    beforeRoute: async lat => { if (lat === zones[1].centroidLat) await checking; },
+    onLandCheck: async candidate => { candidate.landCheck = { status: 'checking' }; checkingStarted(); await new Promise(setImmediate); },
+  });
+  assert.equal(state.candidates.length, 1); assert.equal(state.candidates[0].lat, zones[0].centroidLat);
+  assert.equal(state.candidates[0].landCheck.status, 'checking'); assert.equal(calls.land.length, 1);
+  assert.equal(calls.landTargets[0].lat, zones[0].centroidLat);
+});
+
+test('retry refresh: a later accepted start resets worker ownership without persisting the run lock', async () => {
+  const zones = [sameCellCollision()[0]];
+  zones[0].centroidLng = -120; zones[0].points.forEach(p => { p.lng = -120; });
+  const { state, cell, calls, context } = await run({ zones, roads: false });
+  const old = state.candidates[0], id = old.id, oldScore = old.score;
+  assert.equal(old.researchPending, false); assert.equal(calls.land.length, 0);
+  Object.assign(zones[0], { pointCount: 6, maxElev: 1800 });
+  cell.status = 'pending'; state.status = 'paused';
+  await context.startReconMission(state);
+  assert.equal(state.candidates.length, 1); assert.equal(old.id, id); assert.ok(old.score > oldScore);
+  assert.equal(calls.scans, 2); assert.equal(calls.land.length, 0);
+  assert.ok(!JSON.stringify(state).includes('processedCandidateIds'));
+});

@@ -2458,7 +2458,10 @@ async function startReconMission(next,retryTiles=[]) {
   try {
     if(retryTiles.length) RunEngine.retryIncompleteDEMTiles(retryTiles);
     renderMissionCockpit();
-    await Promise.all([runMissionWorker('Alpine-1'), runMissionWorker('Alpine-2')]);
+    // Queue ownership belongs to this invocation, not the persisted mission.
+    // Pause keeps the same set; a later accepted Retry/Resume gets a fresh one.
+    const processedCandidateIds = new Set();
+    await Promise.all([runMissionWorker('Alpine-1', processedCandidateIds), runMissionWorker('Alpine-2', processedCandidateIds)]);
     if (!missionStopRequested && reconMission.cells.every(c => ['complete','rejected','error','data_review'].includes(c.status))) {
       reconMission.status = 'complete';
     }
@@ -2474,7 +2477,7 @@ async function startReconMission(next,retryTiles=[]) {
   return !missionStorageFailed;
 }
 
-async function runMissionWorker(agentName) {
+async function runMissionWorker(agentName, processedCandidateIds = new Set()) {
   while (!missionStopRequested) {
     while (missionPaused && !missionStopRequested) await new Promise(r => setTimeout(r, 350));
     const cell = reconMission.cells.find(c => c.status === 'pending' || (c.status === 'error' && c.attempts < 2));
@@ -2564,18 +2567,22 @@ async function runMissionWorker(agentName) {
         const dupe = reconMission.candidates.find(c => missionDistanceM(c, candidate) < 750);
         if (!dupe) {
           reconMission.candidates.push(candidate);
+          if (!deferResearch) processedCandidateIds.add(candidate.id);
           if (!deferResearch && candidate.lat >= 44.35 && candidate.lat <= 49.01 && candidate.lng >= -116.1 && candidate.lng <= -104.0) autoLandChecks.push(candidate.id);
         // Keep parcel evidence and any automatic lookup bound to its original
-        // geometry. Top-three records are marked false before either worker can
-        // queue them; only unprocessed, parcel-unbound duplicates may refresh.
-        } else if (!deferResearch && dupe.researchPending !== false && !dupe.landCheck
+        // geometry. Both workers share this run's processed IDs; persisted
+        // researchPending is descriptive and must not freeze later retries.
+        } else if (!deferResearch && !processedCandidateIds.has(dupe.id) && !dupe.landCheck
           && !missionParcelGeometry.has(dupe.id)
-          && (candidate.score > dupe.score || (candidate.catAccess && !dupe.catAccess))) {
+          && (candidate.score > dupe.score || (candidate.catAccess && !dupe.catAccess)
+            || (candidate.score >= dupe.score && candidate.terrainReviewStatus === 'complete'
+              && dupe.terrainReviewStatus === 'data_review'))) {
           const reviewed = dupe.verdict === 'reject' || dupe.rejectedAt || dupe.manualReview
             || (dupe.verdict === 'sideline' && dupe.rejectReason);
           const savedReview = reviewed && candidate.verdict !== 'reject' ? { verdict:dupe.verdict, rejectReason:dupe.rejectReason,
             rejectedAt:dupe.rejectedAt, manualReview:dupe.manualReview } : (dupe.manualReview ? {manualReview:dupe.manualReview} : {});
           Object.assign(dupe, candidate, { id: dupe.id }, savedReview);
+          processedCandidateIds.add(dupe.id);
           if (!deferResearch && !dupe.landCheck && dupe.lat >= 44.35 && dupe.lat <= 49.01 && dupe.lng >= -116.1 && dupe.lng <= -104.0) autoLandChecks.push(dupe.id);
         }
       }

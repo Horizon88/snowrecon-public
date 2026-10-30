@@ -2394,6 +2394,11 @@ function loadReconMission() {
     reconMission.cells.forEach(c => { if (c.status === 'running') { c.status = 'pending'; c.agent = null; } });
     if (reconMission.status === 'running') reconMission.status = 'paused';
     reconMission.candidates.forEach(c => {
+      // The previous page's request cannot finish in this fresh page session.
+      // Keep its evidence bound to this candidate for the explicit recheck.
+      if (c.landCheck?.status === 'checking') {
+        c.landCheck = { ...c.landCheck, status: 'error', error: 'Check interrupted by page reload. Recheck land to try again.' };
+      }
       if (!c.catAccess || c.catAccess.grade) return;
       const d = c.catAccess.distanceKm * 1000, s = c.catAccess.maxSlopeDeg;
       c.catAccess.grade = d <= 2000 && s <= 18 ? 'A' : d <= 4000 && s <= 20 ? 'B' : d <= 7000 && s <= 24 ? 'C' : 'F';

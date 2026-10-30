@@ -22,6 +22,8 @@ Every screened zone is retained, including the fourth and later zones in each ce
 
 A mission with unresolved cells offers a separate **Retry data review** control; Launch continues to create or resume missions and retains prior exclusions when creating a new one. This explicit action preserves its ID, candidates, exclusions and a snapshot of the prior evidence. It refreshes only recorded failed/incomplete tiles, runs one bounded pass, and preserves user rejection/sidelining decisions; mapped exclusions still take precedence. There is no automatic retry loop. Retry snapshots retain affected cell/candidate evidence and preserve every existing history entry. Storage is checked before a new run or retry begins; a failed write stops research without replacing the last successful saved snapshot. Unsaved current evidence remains available through **Export mission JSON**. No history is silently truncated to make space.
 
+After a page reload, a saved parcel check that was still checking is marked as interrupted. Its existing coordinates and evidence remain intact, and the card's **Recheck land** action starts a new explicit check. Current-session requests and other saved land-check states are unchanged.
+
 Run the dependency-free regression suite with Node.js 22 or newer:
 
 ```sh

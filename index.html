@@ -2509,10 +2509,13 @@ async function runMissionWorker(agentName) {
       let roads = [];
       try { roads = await RunEngine.fetchRoads(cell.bounds); } catch (_) {}
       const autoLandChecks = [];
-      for (const zone of local.slice(0, 3)) {
+      // Retain every screened lead; the rank limit bounds optional source work,
+      // not the research register. Later zones remain available for follow-up.
+      for (const [zoneIndex, zone] of local.entries()) {
+        const deferResearch = zoneIndex >= 3;
         const bestPoint = [...zone.points].sort((a, b) => b.elevation - a.elevation)[0];
         let route = null, routeFlag = null;
-        if (roads.length) {
+        if (!deferResearch && roads.length) {
           try { route = await RunEngine.traceCatRoute(bestPoint.lat, bestPoint.lng, roads); }
           catch (_) { routeFlag = 'route_error'; }
         }
@@ -2543,13 +2546,14 @@ async function runMissionWorker(agentName) {
           score: missionScore, confidence: route ? 0.58 : 0.35,
           verticalM: Math.round(zone.maxVert), clusterSpanM: zone.width,
           preferredVertical: zone.preferredVertical, terrainReviewStatus: screened.status,
+          researchPending: deferResearch,
           aspect: zone.aspectDir, elevationMinM: Math.round(zone.minElev), elevationMaxM: Math.round(zone.maxElev),
           qualifyingSamples: zone.pointCount,
           footprint: zone.points.map(p => [p.lat, p.lng]),
           catAccess: route ? { distanceKm: +(route.distance/1000).toFixed(2), maxSlopeDeg: +route.maxSlope.toFixed(1),
             elevationGainM: Math.round(route.elevGain), grade: accessGrade, score25: Math.round(accessPts), roadType: route.roadType,
             roadAccess: route.roadAccess, roadSurface: route.roadSurface } : null,
-          flags: [routeFlag, !scan.coverage.complete && 'terrain_coverage_incomplete', 'skiable_acreage_unknown', 'usable_width_unknown', 'canopy_unknown',
+          flags: [deferResearch && 'research_deferred', routeFlag, !scan.coverage.complete && 'terrain_coverage_incomplete', 'skiable_acreage_unknown', 'usable_width_unknown', 'canopy_unknown',
             'snow_preservation_unknown', 'avalanche_scenarios_unknown', 'parcel_status_unknown', 'legal_access_unverified'].filter(Boolean),
         };
         const exclusion = findMissionExclusion(candidate.lat, candidate.lng);
@@ -2560,14 +2564,14 @@ async function runMissionWorker(agentName) {
         const dupe = reconMission.candidates.find(c => missionDistanceM(c, candidate) < 750);
         if (!dupe) {
           reconMission.candidates.push(candidate);
-          if (candidate.lat >= 44.35 && candidate.lat <= 49.01 && candidate.lng >= -116.1 && candidate.lng <= -104.0) autoLandChecks.push(candidate.id);
+          if (!deferResearch && candidate.lat >= 44.35 && candidate.lat <= 49.01 && candidate.lng >= -116.1 && candidate.lng <= -104.0) autoLandChecks.push(candidate.id);
         } else if (candidate.score > dupe.score || (candidate.catAccess && !dupe.catAccess)) {
           const reviewed = dupe.verdict === 'reject' || dupe.rejectedAt || dupe.manualReview
             || (dupe.verdict === 'sideline' && dupe.rejectReason);
           const savedReview = reviewed && candidate.verdict !== 'reject' ? { verdict:dupe.verdict, rejectReason:dupe.rejectReason,
             rejectedAt:dupe.rejectedAt, manualReview:dupe.manualReview } : (dupe.manualReview ? {manualReview:dupe.manualReview} : {});
           Object.assign(dupe, candidate, { id: dupe.id }, savedReview);
-          if (!dupe.landCheck && dupe.lat >= 44.35 && dupe.lat <= 49.01 && dupe.lng >= -116.1 && dupe.lng <= -104.0) autoLandChecks.push(dupe.id);
+          if (!deferResearch && !dupe.landCheck && dupe.lat >= 44.35 && dupe.lat <= 49.01 && dupe.lng >= -116.1 && dupe.lng <= -104.0) autoLandChecks.push(dupe.id);
         }
       }
       await Promise.all(autoLandChecks.map(id => checkMissionCandidateLand(id, { silent: true })));

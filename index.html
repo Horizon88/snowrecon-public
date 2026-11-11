@@ -162,6 +162,32 @@
     </div>
   </div>
 
+  <!-- LISTINGS + TAX (from the land app) -->
+  <div class="section" style="padding:8px 16px;background:rgba(59,130,246,0.05)">
+    <div style="display:flex;align-items:center;gap:6px;margin-bottom:5px">
+      <div class="section-label" style="color:var(--accent);margin:0">🏠 Listings for sale</div>
+      <span style="flex:1"></span>
+      <span id="lfCount" style="font-size:9px;color:var(--dim)"></span>
+      <a id="lfApp" href="https://raw.githack.com/Horizon88/land-app/main/docs/index.html" target="_blank" rel="noopener" class="btn" style="font-size:8px;padding:2px 6px;text-decoration:none" title="Open the land app (all listings, hunts, digest, country ranking)">Land app ↗</a>
+    </div>
+    <div style="display:flex;gap:3px;flex-wrap:wrap;margin-bottom:4px" id="lfFilters">
+      <button class="btn" id="btn-listings" onclick="toggleListings(this)" style="color:var(--accent);border-color:rgba(59,130,246,0.4);font-weight:600" title="Show listings from the land app on the map (in view)">Show</button>
+      <button class="btn on" data-lf="all">All</button>
+      <button class="btn" data-lf="n" style="color:var(--green)" title="First seen in the last 7 days">🆕 New</button>
+      <button class="btn" data-lf="c" style="color:var(--orange)" title="Asking price cut in the last 30 days">📉 Cut</button>
+      <button class="btn" data-lf="m" style="color:var(--red)" title="Price cut 5%+ or 6+ months on the market">🤝 Motivated</button>
+      <button class="btn" data-lf="p" style="color:#facc15" title="Your own picks (Instagram finds etc.)">📌 Picks</button>
+    </div>
+    <select id="lfHunt" onchange="drawListings()" style="width:100%;background:#0a0c10;color:var(--text);border:1px solid var(--border);border-radius:3px;font:9px inherit;padding:4px;margin-bottom:5px">
+      <option value="">Any hunt</option>
+    </select>
+    <div style="display:flex;gap:4px;align-items:center">
+      <span class="info-label">Tax notes</span>
+      <select id="lfTaxCountry" onchange="showTaxNote(this.value)" style="flex:1;min-width:0;background:#0a0c10;color:var(--text);border:1px solid var(--border);border-radius:3px;font:9px inherit;padding:3px"><option value="">Pick a country…</option></select>
+    </div>
+    <div id="lfTax" style="display:none;margin-top:5px;font-size:10px;line-height:1.45;background:rgba(0,0,0,0.25);border:1px solid var(--border);border-radius:4px;padding:6px 8px"></div>
+  </div>
+
   <!-- CORRIDOR -->
   <div class="section" style="padding:8px 16px">
     <div style="display:flex;gap:6px;align-items:center">
@@ -5826,12 +5852,133 @@ function toggleEnglishLabels(btn) {
   }
 }
 
-// ===== SHARE STATE — read URL params from Land View =====
+// ===== LISTINGS + TAX — feed published by the land app (Horizon88/land-app) =====
+// docs/recon_feed.json: listings matching the hunts, new / price-cut / motivated, your
+// picks, and each country's tax-residency notes. Drawn only inside the current view.
+const LISTING_FEED = 'https://raw.githubusercontent.com/Horizon88/land-app/main/docs/recon_feed.json';
+let listingFeed = null, listingsOn = false, listingFilter = 'all';
+const listingsLayer = L.layerGroup();
+const LF_COLOR = r => r.f.includes('p') ? '#facc15' : r.f.includes('c') ? '#f59e0b' : r.f.includes('n') ? '#10b981' : r.f.includes('m') ? '#ef4444' : '#3b82f6';
+const lfEsc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const lfMoney = n => n == null ? '?' : n >= 1e6 ? '$' + (n / 1e6).toFixed(n >= 1e7 ? 0 : 2).replace(/\.?0+$/, '') + 'M' : '$' + Math.round(n / 1000) + 'k';
+
+async function loadListingFeed() {
+  if (listingFeed) return listingFeed;
+  document.getElementById('lfCount').textContent = 'loading…';
+  try {
+    listingFeed = await (await fetch(LISTING_FEED, { cache: 'no-cache' })).json();
+  } catch (e) {
+    document.getElementById('lfCount').textContent = 'feed unavailable';
+    log('Listings feed failed to load: ' + e.message, 'err');
+    return null;
+  }
+  if (listingFeed.app) document.getElementById('lfApp').href = listingFeed.app;
+  const hs = document.getElementById('lfHunt');
+  Object.entries(listingFeed.hunts || {}).forEach(([k, label]) => hs.add(new Option(label, k)));
+  const ts = document.getElementById('lfTaxCountry');
+  Object.keys(listingFeed.tax || {}).sort().forEach(cf => ts.add(new Option(cf, cf)));
+  log(`Listings feed: ${listingFeed.listings.length.toLocaleString()} listings (built ${listingFeed.built}).`, 'ok');
+  return listingFeed;
+}
+
+function taxNoteHTML(cf) {
+  const t = listingFeed?.tax?.[cf]; if (!t) return '';
+  const pct = v => v == null ? '?' : v + '%';
+  const home = t.home_rule ? `<div style="color:${t.home_rule.kind === 'hard' ? 'var(--red)' : 'var(--orange)'}">🏡 Owning a home: ${lfEsc(t.home_rule.note)}</div>` : '';
+  return `<div style="font-weight:600;color:#fff">${lfEsc(cf)} — tax</div>
+    <div>🗓 Tax-resident from <b>${t.resident_days ?? '?'} days</b>/yr. ${lfEsc(t.residency || '')}</div>${home}
+    <div>💵 Income tax: top ${pct(t.income_top)}, on income from abroad ${pct(t.income_abroad)}. ${lfEsc(t.income_note || '')}</div>
+    <div style="color:var(--dim)">🏠 Property: ~${pct(t.purchase_pct)} to buy, ~${pct(t.annual_pct)}/yr. ${lfEsc(t.property_note || '')}</div>`;
+}
+function showTaxNote(cf) {
+  const box = document.getElementById('lfTax');
+  box.style.display = cf ? 'block' : 'none';
+  box.innerHTML = cf ? taxNoteHTML(cf) : '';
+}
+
+function listingPopup(r) {
+  const flags = [r.f.includes('n') && '🆕 new', r.f.includes('c') && '📉 price cut', r.f.includes('m') && '🤝 motivated', r.f.includes('p') && '📌 your pick'].filter(Boolean);
+  const hunts = (r.h || []).map(k => listingFeed.hunts[k]).filter(Boolean);
+  const facts = [lfMoney(r.p), r.ac ? `${r.ac >= 10 ? Math.round(r.ac).toLocaleString() : r.ac} ac` : '', r.t, r.v ? `view ${r.v}` : '',
+                 r.dom >= 90 ? `${r.dom} days listed` : '', r.drop ? `−${r.drop}%` : ''].filter(Boolean);
+  const appUrl = `${listingFeed.app}#${encodeURIComponent(r.c || '')}`;
+  return `<div style="max-width:260px;font-size:11px;line-height:1.45">
+    <div style="font-weight:600;color:#fff">${lfEsc(r.n)}</div>
+    <div>${facts.map(lfEsc).join(' · ')}</div>
+    ${flags.length ? `<div style="color:var(--orange)">${flags.join(' · ')}</div>` : ''}
+    ${hunts.length ? `<div style="color:var(--dim)">${hunts.map(lfEsc).join(' · ')}</div>` : ''}
+    ${r.ap ? '<div style="color:var(--dim)">📍 pin is approximate (town / area)</div>' : ''}
+    <div style="display:flex;gap:4px;flex-wrap:wrap;margin:5px 0">
+      <a class="btn" href="${lfEsc(r.u)}" target="_blank" rel="noopener" style="text-decoration:none;font-size:9px">Listing ↗</a>
+      <a class="btn" href="${lfEsc(appUrl)}" target="_blank" rel="noopener" style="text-decoration:none;font-size:9px">${lfEsc(r.c || 'Land app')} ↗</a>
+      <button class="btn" style="font-size:9px;color:var(--cyan)" onclick="listingParcels(${r.la},${r.lo})">Parcels here</button>
+    </div>
+    <details><summary style="cursor:pointer;color:var(--accent)">Tax notes: ${lfEsc(r.cf)}</summary><div style="margin-top:4px">${taxNoteHTML(r.cf) || 'No tax notes for this country yet.'}</div></details>
+  </div>`;
+}
+
+function listingParcels(lat, lng) {
+  map.setView([lat, lng], Math.max(map.getZoom(), 16));
+  const inJapan = lat > 24 && lat < 46 && lng > 122 && lng < 146;
+  if (inJapan) {
+    if (currentRegion !== 'japan') goToRegion('japan');
+    const b = document.getElementById('btn-parcels');
+    if (b && !b.classList.contains('on')) toggleParcels(b);
+    log('Japan parcels on: click the parcel for its 地番 (chiban) and 地番区域, then ⭐ it for registry research.', 'ok');
+  } else {
+    log('Parcel records: Montana via Recon Mission → Check Land; elsewhere use the county parcel viewer.', '');
+  }
+}
+
+function drawListings() {
+  listingsLayer.clearLayers();
+  if (!listingsOn || !listingFeed) return;
+  const b = map.getBounds().pad(0.2), hunt = document.getElementById('lfHunt').value;
+  const rows = listingFeed.listings.filter(r => b.contains([r.la, r.lo]) && (listingFilter === 'all' || r.f.includes(listingFilter))
+                                              && (!hunt || (r.h || []).includes(hunt)));
+  const shown = rows.sort((a, z) => (z.f.length - a.f.length) || ((z.v || 0) - (a.v || 0))).slice(0, 1500);
+  shown.forEach(r => L.circleMarker([r.la, r.lo], { radius: r.f.includes('p') ? 7 : 5, color: '#0a0c10', weight: 1,
+      fillColor: LF_COLOR(r), fillOpacity: 0.9 }).bindPopup(() => listingPopup(r), { maxWidth: 280 }).addTo(listingsLayer));
+  document.getElementById('lfCount').textContent = `${shown.length.toLocaleString()}${rows.length > shown.length ? ' of ' + rows.length.toLocaleString() : ''} in view`;
+}
+
+async function toggleListings(btn) {
+  listingsOn = !listingsOn;
+  btn.classList.toggle('on', listingsOn);
+  if (listingsOn) { if (!(await loadListingFeed())) { listingsOn = false; btn.classList.remove('on'); return; } listingsLayer.addTo(map); }
+  else map.removeLayer(listingsLayer);
+  drawListings();
+}
+document.querySelectorAll('#lfFilters [data-lf]').forEach(b => b.onclick = () => {
+  listingFilter = b.dataset.lf;
+  document.querySelectorAll('#lfFilters [data-lf]').forEach(x => x.classList.toggle('on', x === b));
+  drawListings();
+});
+map.on('moveend', () => { if (listingsOn) drawListings(); });
+
+// ===== SHARE STATE — read URL params (Land View, land app) =====
+// ?lat=&lng=&z= centres the map (switching to the USA+CA terrain source outside Japan);
+// &listing=<url> also turns the listings layer on and opens that listing.
 (function() {
   const p = new URLSearchParams(window.location.search);
   if (p.has('lat') && p.has('lng') && p.has('z')) {
     const lat = parseFloat(p.get('lat')), lng = parseFloat(p.get('lng')), z = parseFloat(p.get('z'));
-    if (!isNaN(lat) && !isNaN(lng) && !isNaN(z)) map.setView([lat, lng], z);
+    if (!isNaN(lat) && !isNaN(lng) && !isNaN(z)) {
+      const inJapan = lat > 24 && lat < 46 && lng > 122 && lng < 146;
+      if (!inJapan && currentRegion === 'japan') goToRegion('usa');
+      map.setView([lat, lng], z);
+    }
+  }
+  if (p.has('listing')) {
+    const want = p.get('listing');
+    toggleListings(document.getElementById('btn-listings')).then(() => {
+      const r = listingFeed?.listings.find(x => x.u === want);
+      if (r) L.popup({ maxWidth: 280 }).setLatLng([r.la, r.lo]).setContent(listingPopup(r)).openOn(map);
+      else if (listingFeed) {
+        const lat = parseFloat(p.get('lat')), lng = parseFloat(p.get('lng'));
+        if (!isNaN(lat)) L.popup().setLatLng([lat, lng]).setContent('<div style="font-size:11px">This listing isn\'t in the recon feed (it doesn\'t match a hunt). Terrain and parcels still work here.</div>').openOn(map);
+      }
+    });
   }
 })();
 
